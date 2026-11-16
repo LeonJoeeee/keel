@@ -138,6 +138,68 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertIn("--output-schema", argv)
             self.assertEqual(argv[-1], "-")
 
+    def test_codex_defaults_xhigh_verify_and_subagent_inheritance(self) -> None:
+        codex = CodexExecutor()
+        defaults = load_defaults()
+        codex_cfg = defaults["executors"]["codex"]
+
+        self.assertEqual(codex_cfg["presets"]["implement"], {"model": "gpt-6.1-sol", "effort": "xhigh"})
+        self.assertEqual(codex_cfg["presets"]["verify"], {"model": "gpt-6.1-sol", "effort": "xhigh"})
+        self.assertEqual(codex_cfg["subagent_default"], {"model": "inherit", "effort": "inherit"})
+
+        self.assertEqual(codex._resolve_model_effort("verify", None, None, defaults), ("gpt-6.1-sol", "xhigh"))
+        self.assertEqual(codex._resolve_model_effort("implement", "inherit", "inherit", defaults), ("gpt-6.1-sol", "xhigh"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            out_file = workdir / "out.md"
+
+            argv_sol = codex.build_exec_argv(
+                workdir=workdir,
+                mode="read",
+                model="gpt-6.1-sol",
+                effort="xhigh",
+                output_path=out_file,
+                defaults=defaults,
+            )
+            self.assertIn('agents.default_subagent_model="gpt-6.1-sol"', argv_sol)
+            self.assertIn('agents.default_subagent_reasoning_effort="xhigh"', argv_sol)
+            self.assertFalse(any("gpt-6.1-terra" in tok for tok in argv_sol))
+            self.assertFalse(any('="inherit"' in tok for tok in argv_sol))
+
+            argv_astra = codex.build_exec_argv(
+                workdir=workdir,
+                mode="write",
+                model="gpt-6-astra",
+                effort="max",
+                output_path=out_file,
+                defaults=defaults,
+            )
+            self.assertIn('agents.default_subagent_model="gpt-6-astra"', argv_astra)
+            self.assertIn('agents.default_subagent_reasoning_effort="max"', argv_astra)
+            self.assertFalse(any("gpt-6.1-terra" in tok for tok in argv_astra))
+
+            explicit_override_defaults = {
+                "executors": {
+                    "codex": {
+                        "subagent_default": {
+                            "model": "gpt-6.1-terra",
+                            "effort": "high",
+                        }
+                    }
+                }
+            }
+            argv_override = codex.build_exec_argv(
+                workdir=workdir,
+                mode="read",
+                model="gpt-6.1-sol",
+                effort="xhigh",
+                output_path=out_file,
+                defaults=explicit_override_defaults,
+            )
+            self.assertIn('agents.default_subagent_model="gpt-6.1-terra"', argv_override)
+            self.assertIn('agents.default_subagent_reasoning_effort="high"', argv_override)
+
     def test_universal_context_engineering_and_pluggable_third_executor(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "proj"

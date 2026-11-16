@@ -8,12 +8,14 @@ description: >-
 
 Resolve `<keel>` as this plugin's root directory (two levels above this `SKILL.md`, i.e., `../../scripts/keel`).
 
-## 1. Proportional task sizing (do not over-spawn)
+## 1. Proportional task sizing & model-tier routing
 - **Single-point, clear, atomic tasks** (1–5 line fixes, quick read-only checks): handle directly or in one lightweight pass — never chain pre-code challenge + worker + reviewer subagents on trivial work.
 - **Parallel or context-heavy slices** (independent modules, deep reconnaissance, prototype comparisons, clean-context verification): split along non-overlapping file boundaries so two writers never touch the same file concurrently.
-- **Executor routing defaults** (`../../config/defaults.json`, explicit human instructions always win):
-  - Architecture, specs/ADRs, open-ended research & synthesis → `--executor agy` (`Model="inherit"`, `TypeName="self"`, never `TypeName="research"` which strips network and MCP).
-  - Bounded coding, bug fixes, tests, pipelines, or cross-model verification → `--executor codex` (`gpt-6.1-sol`).
+- **Executor & model-tier routing** (`../../config/defaults.json`, explicit human instructions always win):
+  - **Research, synthesis, specs/ADRs, and architecture (`general`):** `--executor agy` (`TypeName="self"`, `Model="inherit"`; never `TypeName="research"`, which strips network and MCP access).
+  - **Implementation (`implement`) & independent verification (`verify`):** `--executor codex` (`gpt-6.1-sol` at `xhigh`) or `--executor agy` (`Model="inherit"`), with Codex child subagents inheriting the parent run's `(model, effort)` (Codex `general` defaults to `gpt-6.1-sol` at `high`).
+  - **Highest-difficulty cross-system arbitration / design fallback on Codex:** `--executor codex --model gpt-6-astra --effort max` (child subagents inherit `gpt-6-astra` at `max`).
+  - **Purely mechanical checks / narrow execution helpers:** Codex `gpt-6.1-terra` (`high`) or `gpt-6-luna` (quick single-point checks), or Antigravity `Model="flash"` — never downgrading judgment, research, implementation, or verification tasks.
 
 ## 2. Unified worktree lifecycle (`mode=write`)
 All executors share `.agents/worktrees/<slug>` so Antigravity, Codex CLI, and future executors can seamlessly hand off the same isolated branch without polluting the main checkout:

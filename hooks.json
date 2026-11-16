@@ -1,0 +1,16 @@
+{
+  "keel-command-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./hooks/pre-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

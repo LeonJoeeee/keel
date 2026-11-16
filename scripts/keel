@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Keel CLI — lightweight multi-side subagent dispatcher, worktree manager, and PR gate."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+from typing import Any
+
+sys.dont_write_bytecode = True
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from keel_lib import KeelError, SCHEMAS_DIR, load_defaults  # noqa: E402
+from keel_lib.context import (  # noqa: E402
+    assemble_brief,
+    generate_run_id,
+    load_run_record,
+    runs_root_dir,
+    save_run_record,
+)
+from keel_lib.env_gh import detect_repo_slug, gh_api, run_cmd, safe_resolve  # noqa: E402
+from keel_lib.executors import EXECUTORS, RunRequest, get_executor  # noqa: E402
+from keel_lib.guard_rules import detect_agent_mode  # noqa: E402
+from keel_lib.pr_gate import (  # noqa: E402
+    compare_rebase,
+    evaluate_and_merge_pr,
+    evaluate_ci_checks,
+    format_review_comment,
+    parse_review_comments,
+    validate_verdict_payload,
+)
+from keel_lib.worktree import (  # noqa: E402
+    cleanup_worktree,
+    create_disposable_clone,
+    create_worktree,
+    ensure_agents_dir_ignored,
+    git_toplevel,
+    list_worktrees,
+    validate_slug,
+)
+
+
+def _resolve_project_root(project_arg: str | None) -> Path | None:
+    target = Path(project_arg) if project_arg else Path.cwd()
+    chk = run_cmd(["git", "rev-parse", "--path-format=absolute", "--show-toplevel"], cwd=target, check=False)
+    if chk.returncode == 0 and chk.stdout.strip():
+        return safe_resolve(chk.stdout.strip())
+    return None
+
+
+def _cmd_worktree_create(args: argparse.Namespace) -> dict[str, Any]:
+    return create_worktree(
+        args.project or Path.cwd(),
+        args.slug,
+        base=args.base,
+        branch=args.branch,
+        fetch=not args.no_fetch,
+    )
+
+
+def _cmd_worktree_list(args: argparse.Namespace) -> dict[str, Any]:
+    return {"worktrees": list_worktrees(args.project or Path.cwd())}
+
+
+def _cmd_worktree_cleanup(args: argparse.Namespace) -> dict[str, Any]:
+    proj = git_toplevel(args.project or Path.cwd())
+    merged_head_sha: str | None = None
+    if not args.discard:
+        if args.pr is None:
+            raise KeelError("Pass --pr <merged-pr-number> or (with human authorization) --discard.")
+        repo = args.repo or detect_repo_slug(proj)
+        pr_data = gh_api(f"repos/{repo}/pulls/{args.pr}", cwd=proj)
+        if not isinstance(pr_data, dict) or not pr_data.get("merged_at"):
+            raise KeelError(f"PR #{args.pr} is not merged yet; refusing worktree cleanup without --discard.")
+        merged_head_sha = str(((pr_data.get("head") or {}).get("sha") or "")).strip()
+    return cleanup_worktree(proj, args.slug, merged_head_sha=merged_head_sha, discard=args.discard)
+
+
+def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
+    defaults = load_defaults()
+    preset = args.preset
+    mode = args.mode or ("write" if preset == "implement" else "read")
+    executor_name = args.executor or defaults.get("routing", {}).get(preset, "codex")
+    adapter = get_executor(executor_name)
+
+    project_root = _resolve_project_root(args.project)
+    if project_root is not None:
+        ensure_agents_dir_ignored(project_root)
+
+    if args.worktree:
+        if project_root is None:
+            raise KeelError("--worktree requires running inside or pointing --project at a Git repository.")
+        slug = validate_slug(args.worktree)
+        wt_dir = project_root / ".agents" / "worktrees" / slug
+        if not wt_dir.is_dir():
+            create_worktree(project_root, slug, base=args.base)
+        workdir = wt_dir
+    elif args.cwd:
+        workdir = safe_resolve(args.cwd)
+    elif project_root is not None:
+        workdir = project_root
+    else:
+        workdir = safe_resolve(Path.cwd())
+
+    task_text = args.task or ""
+    if args.task_file:
+        task_text = Path(args.task_file).read_text(encoding="utf-8")
+
+    run_id = args.run_id or generate_run_id(preset)
+    run_dir = runs_root_dir(project_root, Path(tempfile.gettempdir())) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    schema_path = safe_resolve(args.schema) if args.schema else (
+        (SCHEMAS_DIR / "verdict.schema.json") if preset == "verify" and args.enforce_verdict_schema else None
+    )
+    output_path = safe_resolve(args.output) if args.output else (
+        run_dir / ("verdict.json" if schema_path else "output.md")
+    )
+    brief_path = run_dir / "brief.md"
+
+    brief_content = assemble_brief(
+        why=args.why,
+        task=task_text,
+        preset=preset,
+        mode=mode,
+        workdir=workdir,
+        project_root=project_root,
+        native_agent_docs=adapter.native_agent_docs,
+        schema_path=schema_path,
+        output_path=output_path,
+        inject_schema_in_brief=adapter.inject_schema_in_brief,
+    )
+    brief_path.write_text(brief_content, encoding="utf-8")
+
+    req = RunRequest(
+        run_id=run_id,
+        run_dir=run_dir,
+        brief_path=brief_path,
+        workdir=workdir,
+        project_root=project_root,
+        mode=mode,
+        preset=preset,
+        model=args.model,
+        effort=args.effort,
+        schema_path=schema_path,
+        output_path=output_path,
+        agy_workspace=args.agy_workspace,
+    )
+    exec_result = adapter.execute(req, defaults)
+
+    record: dict[str, Any] = {
+        "run_id": run_id,
+        "executor": adapter.name,
+        "preset": preset,
+        "mode": mode,
+        "workdir": str(workdir),
+        "project_root": str(project_root) if project_root else None,
+        "brief_path": str(brief_path),
+        "schema_path": str(schema_path) if schema_path else None,
+        **exec_result,
+    }
+    save_run_record(run_dir, record)
+    return record
+
+
+def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
+    defaults = load_defaults()
+    project_root = _resolve_project_root(args.project)
+    run_dir, record = load_run_record(project_root, args.run_id, Path(tempfile.gettempdir()))
+    adapter = get_executor(record["executor"])
+
+    msg = args.message or ""
+    if args.message_file:
+        msg = Path(args.message_file).read_text(encoding="utf-8")
+    if not msg.strip():
+        raise KeelError("Provide --message or --message-file for resume.")
+
+    followup_path = run_dir / f"followup-{generate_run_id('msg')}.md"
+    followup_path.write_text(msg.strip() + "\n", encoding="utf-8")
+    output_path = safe_resolve(args.output) if args.output else Path(record["output_path"])
+
+    res = adapter.resume(run_dir, record, followup_path, output_path, defaults)
+    record.update(res)
+    save_run_record(run_dir, record)
+    return record
+
+
+def _effective_caller_mode(project_arg: str | None) -> str:
+    cwd_mode = detect_agent_mode(cwd=str(Path.cwd()))
+    if cwd_mode != "main":
+        return cwd_mode
+    if project_arg:
+        return detect_agent_mode(cwd=str(Path(project_arg)))
+    return "main"
+
+
+def _cmd_pr_verify(args: argparse.Namespace) -> dict[str, Any]:
+    if args.publish and _effective_caller_mode(args.project) == "read":
+        raise KeelError("Read-only subagent mode cannot publish PR reviews (`--publish`).")
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    ensure_agents_dir_ignored(proj)
+    repo = args.repo or detect_repo_slug(proj)
+
+    pr = gh_api(f"repos/{repo}/pulls/{args.pr}", cwd=proj)
+    if not isinstance(pr, dict):
+        raise KeelError(f"Failed to fetch PR #{args.pr}.")
+
+    head_sha = str(((pr.get("head") or {}).get("sha") or "")).lower()
+    base_ref = str(((pr.get("base") or {}).get("ref") or "main"))
+    title = str(pr.get("title") or "").strip()
+    body = str(pr.get("body") or "").strip()
+
+    remotes = run_cmd(["git", "remote"], cwd=proj).stdout.splitlines()
+    if "origin" in remotes:
+        run_cmd(["git", "fetch", "--quiet", "--no-tags", "origin", base_ref, head_sha], cwd=proj, check=False)
+
+    base_sha = run_cmd(["git", "merge-base", f"origin/{base_ref}" if "origin" in remotes else base_ref, head_sha], cwd=proj).stdout.strip()
+
+    raw_comments = gh_api(f"repos/{repo}/issues/{args.pr}/comments", ("--paginate",), cwd=proj)
+    repo_owner = repo.split("/", 1)[0] if "/" in repo else None
+    review_state = parse_review_comments(
+        raw_comments if isinstance(raw_comments, list) else [],
+        repo_owner=repo_owner,
+    )
+    max_rounds = int(defaults.get("max_review_rounds", 2))
+    if review_state["request_changes_rounds"] >= max_rounds and not args.force_round:
+        raise KeelError(
+            f"PR #{args.pr} already has {review_state['request_changes_rounds']} 'Request changes' rounds "
+            f"(>= {max_rounds}-round convergence cap). Escalate to the human instead of spinning another loop."
+        )
+
+    executor_name = args.executor or defaults.get("routing", {}).get("verify", "codex")
+    adapter = get_executor(executor_name)
+    run_id = generate_run_id(f"verify-pr{args.pr}")
+
+    scratch_root = Path(args.output_dir) if args.output_dir else Path(tempfile.mkdtemp(prefix=f"keel-verify-pr{args.pr}-"))
+    checkout_dir, sep_git_dir = create_disposable_clone(proj, head_sha, scratch_root)
+
+    extra_ctx = Path(args.context_file).read_text(encoding="utf-8").strip() if args.context_file else ""
+    why_text = args.why or (
+        f"Independently verify PR #{args.pr} ('{title}') against the repository's Core need before integration into '{base_ref}'."
+    )
+    task_lines = [
+        f"- **Repository:** `{repo}`",
+        f"- **PR:** `#{args.pr}` — {title}",
+        f"- **Pinned head commit:** `{head_sha}`",
+        f"- **Merge-base commit:** `{base_sha}` (inspect full diff via `git diff {base_sha}..{head_sha}`)",
+    ]
+    if body:
+        task_lines.extend(["", "### PR Description", body])
+    if extra_ctx:
+        task_lines.extend(["", "### Additional Context", extra_ctx])
+
+    run_dir = runs_root_dir(proj, Path(tempfile.gettempdir())) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = SCHEMAS_DIR / "verdict.schema.json"
+    verdict_path = scratch_root / "verdict.json"
+    brief_path = run_dir / "brief.md"
+
+    brief_path.write_text(
+        assemble_brief(
+            why=why_text,
+            task="\n".join(task_lines),
+            preset="verify",
+            mode="read",
+            workdir=checkout_dir,
+            project_root=proj,
+            native_agent_docs=adapter.native_agent_docs,
+            schema_path=schema_path,
+            output_path=verdict_path,
+            inject_schema_in_brief=adapter.inject_schema_in_brief,
+        ),
+        encoding="utf-8",
+    )
+
+    req = RunRequest(
+        run_id=run_id,
+        run_dir=run_dir,
+        brief_path=brief_path,
+        workdir=checkout_dir,
+        project_root=proj,
+        mode="read",
+        preset="verify",
+        model=args.model,
+        effort=args.effort,
+        schema_path=schema_path,
+        output_path=verdict_path,
+        extra_git_dirs=(sep_git_dir,),
+    )
+
+    try:
+        exec_res = adapter.execute(req, defaults)
+        if exec_res.get("status") != "completed":
+            rec = {
+                "run_id": run_id,
+                "executor": adapter.name,
+                "preset": "verify",
+                "mode": "read",
+                "workdir": str(checkout_dir),
+                "project_root": str(proj),
+                "brief_path": str(brief_path),
+                "schema_path": str(schema_path),
+                "pr": args.pr,
+                "repo": repo,
+                "head_sha": head_sha,
+                "scratch_root": str(scratch_root),
+                "verdict_path": str(verdict_path),
+                **exec_res,
+            }
+            save_run_record(run_dir, rec)
+            return rec
+
+        verdict_raw = json.loads(verdict_path.read_text(encoding="utf-8"))
+        validated = validate_verdict_payload(verdict_raw)
+        published_comment_id = None
+        if args.publish:
+            comment_md = format_review_comment(
+                validated,
+                head_sha=head_sha,
+                executor=adapter.name,
+                model=exec_res.get("model"),
+            )
+            posted = gh_api(
+                f"repos/{repo}/issues/{args.pr}/comments",
+                ("-X", "POST", "-f", f"body={comment_md}"),
+                cwd=proj,
+            )
+            if isinstance(posted, dict):
+                published_comment_id = posted.get("id")
+        if not args.output_dir and scratch_root.exists():
+            shutil.rmtree(scratch_root, ignore_errors=True)
+        return {
+            "run_id": run_id,
+            "pr": args.pr,
+            "repo": repo,
+            "head_sha": head_sha,
+            "executor": adapter.name,
+            "model": exec_res.get("model"),
+            "verdict": validated,
+            "published": bool(args.publish),
+            "comment_id": published_comment_id,
+        }
+    except Exception:
+        if not args.output_dir and scratch_root.exists():
+            shutil.rmtree(scratch_root, ignore_errors=True)
+        raise
+
+
+def _cmd_pr_publish_verdict(args: argparse.Namespace) -> dict[str, Any]:
+    if _effective_caller_mode(args.project) == "read":
+        raise KeelError("Read-only subagent mode cannot run `keel pr publish-verdict`.")
+    proj = git_toplevel(args.project or Path.cwd())
+    repo = args.repo or detect_repo_slug(proj)
+    verdict_file = Path(args.verdict_file)
+    if not verdict_file.is_file():
+        raise KeelError(f"Verdict file not found: {verdict_file}")
+
+    validated = validate_verdict_payload(json.loads(verdict_file.read_text(encoding="utf-8")))
+    comment_md = format_review_comment(
+        validated,
+        head_sha=args.head_sha.lower(),
+        executor=args.executor,
+        model=args.model,
+    )
+    posted = gh_api(
+        f"repos/{repo}/issues/{args.pr}/comments",
+        ("-X", "POST", "-f", f"body={comment_md}"),
+        cwd=proj,
+    )
+    if args.cleanup_scratch:
+        scratch = Path(args.cleanup_scratch)
+        if scratch.exists() and scratch.name.startswith("keel-verify-"):
+            shutil.rmtree(scratch, ignore_errors=True)
+    return {
+        "pr": args.pr,
+        "repo": repo,
+        "head_sha": args.head_sha.lower(),
+        "verdict": validated,
+        "comment_id": posted.get("id") if isinstance(posted, dict) else None,
+    }
+
+
+def _cmd_pr_status(args: argparse.Namespace) -> dict[str, Any]:
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    repo = args.repo or detect_repo_slug(proj)
+    return evaluate_and_merge_pr(
+        repo=repo,
+        pr_number=args.pr,
+        project_root=proj,
+        execute=False,
+        max_review_rounds=int(defaults.get("max_review_rounds", 2)),
+    )
+
+
+def _cmd_pr_compare(args: argparse.Namespace) -> dict[str, Any]:
+    proj = git_toplevel(args.project or Path.cwd())
+    return compare_rebase(proj, args.old_base, args.old_head, args.base, args.head)
+
+
+def _cmd_pr_merge(args: argparse.Namespace) -> dict[str, Any]:
+    if args.execute and _effective_caller_mode(args.project) in ("read", "write"):
+        raise KeelError("Subagents cannot execute `keel pr merge --execute`; return to the main session.")
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    repo = args.repo or detect_repo_slug(proj)
+    return evaluate_and_merge_pr(
+        repo=repo,
+        pr_number=args.pr,
+        project_root=proj,
+        old_base=args.old_base,
+        old_head=args.old_head,
+        human_override=args.human_override,
+        execute=args.execute,
+        max_review_rounds=int(defaults.get("max_review_rounds", 2)),
+    )
+
+
+class _StrictArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _StrictArgumentParser(prog="keel", description="Keel multi-side engineering spine CLI.")
+    sub = parser.add_subparsers(dest="domain", required=True, parser_class=_StrictArgumentParser)
+
+    # 1. worktree
+    wt = sub.add_parser("worktree", help="Manage isolated .agents/worktrees/<slug> workspaces.")
+    wt_sub = wt.add_subparsers(dest="action", required=True, parser_class=_StrictArgumentParser)
+
+    wt_c = wt_sub.add_parser("create", help="Create an isolated git worktree.")
+    wt_c.add_argument("slug")
+    wt_c.add_argument("--project")
+    wt_c.add_argument("--base", default="origin/main")
+    wt_c.add_argument("--branch")
+    wt_c.add_argument("--no-fetch", action="store_true")
+    wt_c.set_defaults(func=_cmd_worktree_create)
+
+    wt_l = wt_sub.add_parser("list", help="List git worktrees.")
+    wt_l.add_argument("--project")
+    wt_l.set_defaults(func=_cmd_worktree_list)
+
+    wt_rm = wt_sub.add_parser("cleanup", help="Safely remove a merged or discarded worktree.")
+    wt_rm.add_argument("slug")
+    wt_rm.add_argument("--project")
+    wt_rm.add_argument("--repo")
+    wt_rm.add_argument("--pr", type=int)
+    wt_rm.add_argument("--discard", action="store_true")
+    wt_rm.set_defaults(func=_cmd_worktree_cleanup)
+
+    # 2. agent
+    ag = sub.add_parser("agent", help="Dispatch or resume universal side-agent runs.")
+    ag_sub = ag.add_subparsers(dest="action", required=True, parser_class=_StrictArgumentParser)
+
+    ag_r = ag_sub.add_parser("run", help="Assemble context brief and dispatch a side-agent run.")
+    ag_r.add_argument("--why", required=True, help="1-3 sentences bridging this task to the project's Core need.")
+    ag_r.add_argument("--task", help="Task goal, scope boundaries, and done criteria.")
+    ag_r.add_argument("--task-file", help="Read task specification from file.")
+    ag_r.add_argument("--preset", default="general", help="Context preset name (general, implement, verify).")
+    ag_r.add_argument("--mode", choices=["read", "write"], help="Sandbox/workspace mode.")
+    ag_r.add_argument("--executor", choices=sorted(EXECUTORS), help="Side-agent executor adapter.")
+    ag_r.add_argument("--model")
+    ag_r.add_argument("--effort")
+    ag_r.add_argument("--project")
+    ag_r.add_argument("--worktree", help="Create/use .agents/worktrees/<slug>.")
+    ag_r.add_argument("--base", default="origin/main")
+    ag_r.add_argument("--cwd")
+    ag_r.add_argument("--agy-workspace", default="inherit", choices=["inherit", "share", "branch"])
+    ag_r.add_argument("--schema", help="Optional JSON Schema file path.")
+    ag_r.add_argument("--enforce-verdict-schema", action="store_true")
+    ag_r.add_argument("--output")
+    ag_r.add_argument("--run-id")
+    ag_r.set_defaults(func=_cmd_agent_run)
+
+    ag_res = ag_sub.add_parser("resume", help="Resume an existing side-agent run.")
+    ag_res.add_argument("run_id")
+    ag_res.add_argument("--message")
+    ag_res.add_argument("--message-file")
+    ag_res.add_argument("--project")
+    ag_res.add_argument("--output")
+    ag_res.set_defaults(func=_cmd_agent_resume)
+
+    # 3. pr
+    pr = sub.add_parser("pr", help="Stateless PR active verification, rebase equivalence, and guarded merge.")
+    pr_sub = pr.add_subparsers(dest="action", required=True, parser_class=_StrictArgumentParser)
+
+    pr_v = pr_sub.add_parser("verify", help="Run clean-context verification on a pull request in a disposable clone.")
+    pr_v.add_argument("pr", type=int)
+    pr_v.add_argument("--project")
+    pr_v.add_argument("--repo")
+    pr_v.add_argument("--executor", choices=sorted(EXECUTORS))
+    pr_v.add_argument("--model")
+    pr_v.add_argument("--effort")
+    pr_v.add_argument("--why")
+    pr_v.add_argument("--context-file")
+    pr_v.add_argument("--publish", action="store_true")
+    pr_v.add_argument("--output-dir")
+    pr_v.add_argument("--force-round", action="store_true")
+    pr_v.set_defaults(func=_cmd_pr_verify)
+
+    pr_pub = pr_sub.add_parser("publish-verdict", help="Validate and publish a verdict.json file to a PR.")
+    pr_pub.add_argument("pr", type=int)
+    pr_pub.add_argument("--verdict-file", required=True)
+    pr_pub.add_argument("--head-sha", required=True)
+    pr_pub.add_argument("--executor", default="agy")
+    pr_pub.add_argument("--model")
+    pr_pub.add_argument("--project")
+    pr_pub.add_argument("--repo")
+    pr_pub.add_argument("--cleanup-scratch")
+    pr_pub.set_defaults(func=_cmd_pr_publish_verdict)
+
+    pr_st = pr_sub.add_parser("status", help="Inspect PR ancestry, CI checks, and review convergence status.")
+    pr_st.add_argument("pr", type=int)
+    pr_st.add_argument("--project")
+    pr_st.add_argument("--repo")
+    pr_st.set_defaults(func=_cmd_pr_status)
+
+    pr_cmp = pr_sub.add_parser("compare", help="Prove pure-rebase mathematical git-tree equivalence.")
+    pr_cmp.add_argument("--old-base", required=True)
+    pr_cmp.add_argument("--old-head", required=True)
+    pr_cmp.add_argument("--base", required=True)
+    pr_cmp.add_argument("--head", required=True)
+    pr_cmp.add_argument("--project")
+    pr_cmp.set_defaults(func=_cmd_pr_compare)
+
+    pr_m = pr_sub.add_parser("merge", help="Verify PR gates and optionally execute SHA-pinned squash merge.")
+    pr_m.add_argument("pr", type=int)
+    pr_m.add_argument("--project")
+    pr_m.add_argument("--repo")
+    pr_m.add_argument("--old-base")
+    pr_m.add_argument("--old-head")
+    pr_m.add_argument("--human-override")
+    pr_m.add_argument("--execute", action="store_true")
+    pr_m.set_defaults(func=_cmd_pr_merge)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    except KeelError as exc:
+        print(f"keel error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

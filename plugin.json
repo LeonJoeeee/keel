@@ -1,0 +1,11 @@
+{
+  "name": "keel",
+  "version": "0.1.0",
+  "description": "Lightweight multi-side engineering spine for Antigravity and Codex CLI: core-need alignment, pluggable subagent dispatch, active clean-context verification, and guarded integration.",
+  "repository": "https://github.com/LeonJoeeee/keel",
+  "author": {
+    "name": "Leon"
+  },
+  "license": "MIT",
+  "logo": "assets/logo.svg"
+}

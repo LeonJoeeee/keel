@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "summary",
+    "blocking",
+    "notes",
+    "commands_run"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "request_changes"],
+      "description": "Use 'approve' iff blocking is empty and active verification succeeded; otherwise 'request_changes'."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Concise factual synthesis of what was checked and why the change passes or fails."
+    },
+    "blocking": {
+      "type": "array",
+      "description": "Real correctness, safety, scope, regression, test-weakening, or core-need defects that MUST be fixed before merge. Prefix with '[Needs human decision]' when fixing requires a product or architecture tradeoff.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "description": "Optional non-blocking observations or polish suggestions. Never block approval or trigger re-review.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "commands_run": {
+      "type": "array",
+      "description": "Deterministic verification commands and edge-case probes executed during this review.",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

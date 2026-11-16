@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Dual-protocol PreToolUse guard (Antigravity camelCase + Codex CLI snake_case).
+
+- Auto-binds fresh native Antigravity subagent `conversationId -> mode` via public `PreToolUse`
+  `read_file` events when a new subagent reads its `.agents/runs/<run_id>/brief.md` assignment,
+  while pre-registering existing parent conversations so reading `brief.md` from a main session
+  can never poison the main session's mode.
+- Bounded non-blocking stdin read (never stalls if host leaves pipe open after JSON).
+- Unconditionally allows non-shell tools (`write_file`, `edit_file`, `read_file`).
+- Fails open on internal hook errors so a malformed event never bricks active sessions.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import select
+import sys
+import tempfile
+from typing import Any
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from keel_lib.guard_rules import detect_agent_mode, evaluate_command  # noqa: E402
+
+
+def _conv_registry_path() -> Path:
+    plugin_data = os.environ.get("PLUGIN_DATA")
+    base = Path(plugin_data) if plugin_data else (Path(tempfile.gettempdir()) / f"keel-state-{os.getuid()}")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "conv_modes.json"
+
+
+def _load_conv_registry() -> dict[str, str]:
+    reg_path = _conv_registry_path()
+    if not reg_path.is_file():
+        return {}
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_conv_registry(data: dict[str, str]) -> None:
+    try:
+        if len(data) > 256:
+            for old_key in list(data.keys())[:-256]:
+                data.pop(old_key, None)
+        _conv_registry_path().write_text(json.dumps(data) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _ensure_conv_registered(conv_id: str | None, cwd: str | None) -> str:
+    inferred = detect_agent_mode(cwd=cwd)
+    if not conv_id:
+        return inferred
+    data = _load_conv_registry()
+    existing = data.get(conv_id)
+    if existing in ("main", "read", "write"):
+        return existing
+    data[conv_id] = inferred
+    _save_conv_registry(data)
+    return inferred
+
+
+def _record_conv_mode_from_brief(conv_id: str | None, read_path_str: str | None, cwd: str | None) -> None:
+    if not conv_id:
+        return
+    data = _load_conv_registry()
+    # Never overwrite an already-registered conversation (e.g., main orchestrator inspecting brief.md)!
+    if conv_id in data:
+        return
+    if read_path_str:
+        p = Path(read_path_str)
+        if p.name == "brief.md":
+            run_json = p.parent / "run.json"
+            if run_json.is_file():
+                try:
+                    rec = json.loads(run_json.read_text(encoding="utf-8"))
+                    mode = rec.get("mode")
+                    if rec.get("executor") == "agy" and mode in ("read", "write"):
+                        data[conv_id] = mode
+                        _save_conv_registry(data)
+                        return
+                except (OSError, json.JSONDecodeError):
+                    pass
+    data[conv_id] = detect_agent_mode(cwd=cwd)
+    _save_conv_registry(data)
+
+
+def _read_stdin_json(timeout_sec: float = 0.25) -> dict[str, Any] | None:
+    chunks: list[bytes] = []
+    fd = sys.stdin.fileno()
+    decoder = json.JSONDecoder()
+    while True:
+        wait = timeout_sec if not chunks else 0.02
+        ready, _, _ = select.select([fd], [], [], wait)
+        if not ready:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        text = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        if text:
+            try:
+                val, end = decoder.raw_decode(text)
+                if end == len(text) and isinstance(val, dict):
+                    return val
+            except json.JSONDecodeError:
+                continue
+    raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    if not raw:
+        return None
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def main() -> None:
+    event = _read_stdin_json()
+    if not event:
+        print("{}")
+        return
+
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+    conv_id = event.get("conversationId") if isinstance(event.get("conversationId"), str) else None
+
+    # 1. Antigravity PreToolUse protocol (camelCase)
+    if "toolCall" in event:
+        tc = event.get("toolCall")
+        if not isinstance(tc, dict):
+            print(json.dumps({"decision": "allow"}))
+            return
+        tool_name = tc.get("name")
+        args = tc.get("args") if tc.get("args") is not None else (tc.get("arguments") or {})
+        if tool_name == "read_file":
+            path_arg = args.get("Path") if isinstance(args, dict) else None
+            _record_conv_mode_from_brief(conv_id, path_arg if isinstance(path_arg, str) else None, cwd)
+            print(json.dumps({"decision": "allow"}))
+            return
+        if tool_name != "run_command":
+            _ensure_conv_registered(conv_id, cwd)
+            print(json.dumps({"decision": "allow"}))
+            return
+
+        mode = _ensure_conv_registered(conv_id, cwd)
+        cmd = args.get("CommandLine") if isinstance(args, dict) else None
+        reason = evaluate_command(cmd, mode=mode, cwd=cwd) if isinstance(cmd, str) else None
+        if reason:
+            print(json.dumps({"decision": "deny", "reason": reason}))
+        else:
+            print(json.dumps({"decision": "allow"}))
+        return
+
+    # 2. Codex CLI PreToolUse protocol (snake_case)
+    tool_name = event.get("tool_name")
+    if tool_name not in ("Bash", "exec_command"):
+        print("{}")
+        return
+    mode = detect_agent_mode(cwd=cwd)
+    tool_input = event.get("tool_input")
+    cmd = (tool_input.get("command") or tool_input.get("cmd")) if isinstance(tool_input, dict) else None
+    reason = evaluate_command(cmd, mode=mode, cwd=cwd) if isinstance(cmd, str) else None
+    if reason:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                }
+            )
+        )
+    else:
+        print("{}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # pragma: no cover - defensive fail-open safety net
+        print(f"keel pre-tool-use fail-open: {exc!r}", file=sys.stderr)
+        print("{}")

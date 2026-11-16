@@ -1,0 +1,50 @@
+{
+  "default_branches": ["main", "master"],
+  "max_review_rounds": 2,
+  "routing": {
+    "general": "agy",
+    "implement": "codex",
+    "verify": "codex"
+  },
+  "executors": {
+    "codex": {
+      "models_ranked": [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-6-luna"
+      ],
+      "presets": {
+        "general": {
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        },
+        "implement": {
+          "model": "gpt-6.1-sol",
+          "effort": "xhigh"
+        },
+        "verify": {
+          "model": "gpt-6.1-sol",
+          "effort": "high"
+        }
+      },
+      "subagent_default": {
+        "model": "gpt-6.1-terra",
+        "effort": "high"
+      }
+    },
+    "agy": {
+      "presets": {
+        "general": {
+          "model": "inherit"
+        },
+        "implement": {
+          "model": "inherit"
+        },
+        "verify": {
+          "model": "inherit"
+        }
+      }
+    }
+  }
+}

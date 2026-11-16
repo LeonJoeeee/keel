@@ -396,6 +396,37 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertFalse(bad_plug.exists())
                 self.assertFalse(bad_bin.exists())
 
+            # POSIX symlink + '..' resolution: logical/alias -> physical/child makes logical/alias/../plugin == physical/plugin
+            logical = tmp_path / "logical"
+            physical_child = tmp_path / "physical" / "child"
+            logical.mkdir()
+            physical_child.mkdir(parents=True)
+            (logical / "alias").symlink_to(physical_child)
+            sym_dotdot_overlap = subprocess.run(
+                [
+                    str(installer),
+                    "--plugin-dir",
+                    f"{logical}/alias/../plugin",
+                    "--bin-dir",
+                    str(tmp_path / "physical" / "plugin"),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(sym_dotdot_overlap.returncode, 2)
+            self.assertFalse((tmp_path / "physical" / "plugin").exists())
+
+            # POSIX symlink + '..' into REPO_ROOT must also be blocked by repository-root boundary preflight
+            (logical / "repo_alias").symlink_to(ROOT / "scripts")
+            for repo_escape in (f"{logical}/repo_alias/..", f"{logical}/repo_alias/../sub"):
+                repo_guard = subprocess.run(
+                    [str(installer), "--plugin-dir", repo_escape, "--no-bin"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(repo_guard.returncode, 2)
+            self.assertFalse((ROOT / "sub").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

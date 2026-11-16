@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from keel_lib import KeelError  # noqa: E402
-from keel_lib.env_gh import decode_json_stream, gh_api, run_process_group, safe_resolve, tool_env  # noqa: E402
+from keel_lib.env_gh import decode_json_stream, gh_api, run_cmd, run_process_group, safe_resolve, tool_env  # noqa: E402
 from keel_lib.guard_rules import detect_agent_mode, evaluate_command  # noqa: E402
 
 
@@ -272,6 +272,147 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
 
 
 class EnvAndGhApiTests(unittest.TestCase):
+    def test_run_cmd_missing_executable_raises_keel_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_executable = str(Path(tmp) / "missing-executable")
+            for cwd in (None, tmp):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaisesRegex(KeelError, r"Executable not found \(127\)") as caught:
+                        run_cmd([missing_executable], cwd=cwd, check=True)
+                    self.assertIn(missing_executable, str(caught.exception))
+                    self.assertIsInstance(caught.exception.__cause__, FileNotFoundError)
+
+    def test_run_cmd_missing_executable_without_check_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = [str(Path(tmp) / "missing-executable")]
+            for cwd in (None, tmp):
+                with self.subTest(cwd=cwd):
+                    result = run_cmd(argv, cwd=cwd, check=False)
+                    self.assertEqual(result.args, argv)
+                    self.assertEqual(result.returncode, 127)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(argv[0], result.stderr)
+                    self.assertNotIn("Working directory", result.stderr)
+
+    def test_run_cmd_missing_cwd_raises_keel_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cwd = Path(tmp) / "missing-cwd"
+            for cwd in (missing_cwd, str(missing_cwd)):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\) not found") as caught:
+                        run_cmd([sys.executable, "-c", "pass"], cwd=cwd, check=True)
+                    self.assertIn(str(missing_cwd), str(caught.exception))
+                    self.assertNotIn("Executable not found", str(caught.exception))
+                    self.assertIsInstance(caught.exception.__cause__, FileNotFoundError)
+
+    def test_run_cmd_missing_cwd_without_check_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cwd = Path(tmp) / "missing-cwd"
+            argv = [sys.executable, "-c", "pass"]
+            with self.assertRaises(FileNotFoundError) as caught:
+                subprocess.run(argv, cwd=str(missing_cwd))
+            result = run_cmd(argv, cwd=missing_cwd, check=False)
+            self.assertEqual(result.args, argv)
+            self.assertEqual(result.returncode, 127)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("Working directory (cwd) not found", result.stderr)
+            self.assertIn(str(missing_cwd), result.stderr)
+            self.assertIn(str(caught.exception), result.stderr)
+            self.assertNotIn("Executable not found", result.stderr)
+
+    def test_run_cmd_non_directory_cwd_raises_keel_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "file"
+            file_path.write_text("not a directory", encoding="utf-8")
+            for cwd in (file_path, file_path / "child"):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\)") as caught:
+                        run_cmd([sys.executable, "-c", "pass"], cwd=cwd, check=True)
+                    self.assertIn(str(cwd), str(caught.exception))
+                    self.assertNotIn("Executable not found", str(caught.exception))
+                    self.assertIsInstance(caught.exception.__cause__, NotADirectoryError)
+
+    def test_run_cmd_non_directory_cwd_without_check_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "file"
+            file_path.write_text("not a directory", encoding="utf-8")
+            argv = [sys.executable, "-c", "pass"]
+            for cwd in (file_path, file_path / "child"):
+                with self.subTest(cwd=cwd):
+                    with self.assertRaises(NotADirectoryError) as caught:
+                        subprocess.run(argv, cwd=str(cwd))
+                    result = run_cmd(argv, cwd=cwd, check=False)
+                    self.assertEqual(result.args, argv)
+                    self.assertEqual(result.returncode, 127)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("Working directory (cwd)", result.stderr)
+                    self.assertIn(str(cwd), result.stderr)
+                    self.assertIn(str(caught.exception), result.stderr)
+                    self.assertNotIn("Executable not found", result.stderr)
+
+    def test_run_process_group_missing_executable_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_executable = str(Path(tmp) / "missing-executable")
+            for cwd in (None, tmp):
+                with self.subTest(cwd=cwd):
+                    rc, stderr_text = run_process_group([missing_executable], cwd=cwd)
+                    self.assertEqual(rc, 127)
+                    self.assertIn("Executable not found", stderr_text)
+                    self.assertIn(missing_executable, stderr_text)
+                    self.assertNotIn("Working directory", stderr_text)
+
+    def test_run_process_group_missing_cwd_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cwd = Path(tmp) / "missing-cwd"
+            for cwd in (missing_cwd, str(missing_cwd)):
+                with self.subTest(cwd=cwd):
+                    rc, stderr_text = run_process_group([sys.executable, "-c", "pass"], cwd=cwd)
+                    self.assertEqual(rc, 127)
+                    self.assertIn("Working directory (cwd) not found", stderr_text)
+                    self.assertIn(str(missing_cwd), stderr_text)
+                    self.assertNotIn("Executable not found", stderr_text)
+
+    def test_run_process_group_non_directory_cwd_returns_127(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "file"
+            file_path.write_text("not a directory", encoding="utf-8")
+            for cwd in (file_path, file_path / "child"):
+                with self.subTest(cwd=cwd):
+                    rc, stderr_text = run_process_group([sys.executable, "-c", "pass"], cwd=cwd)
+                    self.assertEqual(rc, 127)
+                    self.assertIn("Working directory (cwd)", stderr_text)
+                    self.assertIn(str(cwd), stderr_text)
+                    self.assertNotIn("Executable not found", stderr_text)
+
+    def test_symlink_loop_cwd_os_error_is_reported_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp) / "loop"
+            cwd.symlink_to(cwd.name)
+            argv = [sys.executable, "-c", "pass"]
+            with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\)") as caught:
+                run_cmd(argv, cwd=cwd, check=True)
+            self.assertIsInstance(caught.exception.__cause__, OSError)
+            result = run_cmd(argv, cwd=cwd, check=False)
+            rc, stderr_text = run_process_group(argv, cwd=cwd)
+            for code, detail in ((result.returncode, result.stderr), (rc, stderr_text)):
+                with self.subTest(detail=detail):
+                    self.assertEqual(code, 127)
+                    self.assertIn("Working directory (cwd)", detail)
+                    self.assertIn(str(caught.exception.__cause__), detail)
+                    self.assertNotIn("Executable not found", detail)
+
+    def test_non_directory_executable_error_with_valid_cwd_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "file"
+            file_path.write_text("not a directory", encoding="utf-8")
+            argv = [str(file_path / "child")]
+            for check in (True, False):
+                with self.subTest(check=check):
+                    with self.assertRaises(NotADirectoryError):
+                        run_cmd(argv, cwd=tmp, check=check)
+            with self.assertRaises(NotADirectoryError):
+                run_process_group(argv, cwd=tmp)
+
     def test_large_stderr_does_not_deadlock_run_process_group(self) -> None:
         lines: list[str] = []
         rc, stderr_text = run_process_group(
@@ -328,11 +469,6 @@ class EnvAndGhApiTests(unittest.TestCase):
         env = tool_env()
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
-        from keel_lib.env_gh import run_cmd
-        res = run_cmd(["nonexistent-keel-binary-xyz"], check=False)
-        self.assertEqual(res.returncode, 127)
-        with self.assertRaises(KeelError):
-            run_cmd(["nonexistent-keel-binary-xyz"], check=True)
 
 
 if __name__ == "__main__":

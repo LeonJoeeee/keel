@@ -380,6 +380,22 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             bad_cli_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
             self.assertNotEqual(bad_cli_chk.returncode, 0)
 
+            # Overlapping --plugin-dir and --bin-dir must be rejected before modifying disk
+            clean_plug = tmp_path / "overlap-plug"
+            for bad_plug, bad_bin in (
+                (clean_plug, clean_plug),
+                (clean_plug, clean_plug / "bin"),
+                (tmp_path / "shared" / "keel", tmp_path / "shared"),
+            ):
+                overlap = subprocess.run(
+                    [str(installer), "--plugin-dir", str(bad_plug), "--bin-dir", str(bad_bin)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(overlap.returncode, 2)
+                self.assertFalse(bad_plug.exists())
+                self.assertFalse(bad_bin.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

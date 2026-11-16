@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 
@@ -55,6 +56,38 @@ def _check(plugin_dir: Path, bin_dir: Path | None) -> int:
     return 0
 
 
+def _preflight_targets(plugin_dir: Path, bin_dir: Path | None) -> None:
+    abs_plugin = Path(os.path.abspath(plugin_dir))
+    for anc in (abs_plugin.parent, *abs_plugin.parent.parents):
+        if (anc.exists() or anc.is_symlink()) and not anc.is_dir():
+            raise RuntimeError(f"Target plugin parent is not a directory: {anc}")
+    real_plugin = (abs_plugin.parent.resolve() / abs_plugin.name) if abs_plugin.is_symlink() else abs_plugin.resolve()
+    if real_plugin.is_relative_to(REPO_ROOT) or REPO_ROOT.is_relative_to(real_plugin):
+        raise RuntimeError(f"Refusing --plugin-dir overlapping repository root: {plugin_dir}")
+    if not plugin_dir.is_symlink():
+        if plugin_dir.exists() and not plugin_dir.is_dir():
+            raise RuntimeError(f"Target plugin path is not a directory: {plugin_dir}")
+        if plugin_dir.is_dir():
+            for item in plugin_dir.iterdir():
+                if not item.is_symlink():
+                    raise RuntimeError(f"Refusing to overwrite or remove non-symlink entry: {item}")
+    if bin_dir is not None:
+        abs_bin = Path(os.path.abspath(bin_dir))
+        for anc in (abs_bin, *abs_bin.parents):
+            if (anc.exists() or anc.is_symlink()) and not anc.is_dir():
+                raise RuntimeError(f"Target bin path component is not a directory: {anc}")
+        real_bin = abs_bin.resolve()
+        if real_bin.is_relative_to(REPO_ROOT):
+            raise RuntimeError(f"Refusing --bin-dir inside repository root: {bin_dir}")
+        if abs_bin.is_relative_to(abs_plugin) or real_bin.is_relative_to(real_plugin):
+            raise RuntimeError(f"Refusing --bin-dir inside --plugin-dir: {bin_dir}")
+        if abs_plugin.is_relative_to(abs_bin / "keel") or real_plugin.is_relative_to(real_bin / "keel"):
+            raise RuntimeError(f"Refusing --plugin-dir colliding with CLI symlink {bin_dir / 'keel'}")
+        cli_dst = bin_dir / "keel"
+        if not cli_dst.is_symlink() and cli_dst.exists():
+            raise RuntimeError(f"Refusing to overwrite non-symlink path: {cli_dst}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     ap.add_argument("--plugin-dir", help="Target plugin dir (default: ~/.gemini/config/plugins/keel)")
@@ -70,23 +103,16 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"Missing required source path: {missing[0]}")
     if args.check:
         return _check(plugin_dir, bin_dir)
-    if not plugin_dir.is_symlink() and plugin_dir.exists() and plugin_dir.resolve() == REPO_ROOT:
-        raise RuntimeError(f"Refusing to use repository root as --plugin-dir: {plugin_dir}")
+    _preflight_targets(plugin_dir, bin_dir)
     if plugin_dir.is_symlink():
         plugin_dir.unlink()
-    if plugin_dir.exists() and not plugin_dir.is_dir():
-        raise RuntimeError(f"Target plugin path is not a directory: {plugin_dir}")
     plugin_dir.mkdir(parents=True, exist_ok=True)
     for item in list(plugin_dir.iterdir()):
         if item.name not in PLUGIN_ENTRIES:
-            if not item.is_symlink():
-                raise RuntimeError(f"Refusing to remove non-symlink entry: {item}")
             item.unlink()
     for name in PLUGIN_ENTRIES:
         _link(REPO_ROOT / name, plugin_dir / name)
     if bin_dir is not None:
-        if bin_dir.exists() and not bin_dir.is_dir():
-            raise RuntimeError(f"Target bin path is not a directory: {bin_dir}")
         bin_dir.mkdir(parents=True, exist_ok=True)
         _link(REPO_ROOT / "scripts" / "keel", bin_dir / "keel")
     print(f"Installed keel plugin symlinks -> {plugin_dir}" + (f" (cli -> {bin_dir / 'keel'})" if bin_dir else ""))
@@ -96,6 +122,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"install-plugin error: {exc}", file=sys.stderr)
         raise SystemExit(2)

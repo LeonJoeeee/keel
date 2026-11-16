@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Install Keel plugin via per-entry symlinks (excluding repo-only root AGENTS.md/docs/tests)."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ENTRIES = (
+    "plugin.json",
+    "hooks.json",
+    "assets",
+    "config",
+    "hooks",
+    "rules",
+    "scripts",
+    "skills",
+    "LICENSE",
+    "README.md",
+)
+
+
+def _link(src: Path, dst: Path) -> None:
+    if dst.is_symlink():
+        dst.unlink()
+    elif dst.exists():
+        raise RuntimeError(f"Refusing to overwrite non-symlink path: {dst}")
+    dst.symlink_to(src)
+
+
+def _valid_link(link: Path, target: Path, strict: bool) -> bool:
+    return link.is_symlink() and link.exists() and (not strict or link.resolve() == target.resolve())
+
+
+def _check(plugin_dir: Path, bin_dir: Path | None, strict_plugin: bool, strict_bin: bool) -> int:
+    if plugin_dir.is_symlink() or not plugin_dir.is_dir():
+        print(f"install-plugin check failed: {plugin_dir} must be a non-symlink directory", file=sys.stderr)
+        return 1
+    if {p.name for p in plugin_dir.iterdir()} != set(PLUGIN_ENTRIES):
+        print(f"install-plugin check failed: entry mismatch in {plugin_dir}", file=sys.stderr)
+        return 1
+    if not all(_valid_link(plugin_dir / n, REPO_ROOT / n, strict_plugin) for n in PLUGIN_ENTRIES):
+        print(f"install-plugin check failed: invalid entry symlink in {plugin_dir}", file=sys.stderr)
+        return 1
+    if bin_dir is not None and not _valid_link(bin_dir / "keel", REPO_ROOT / "scripts" / "keel", strict_bin):
+        print(f"install-plugin check failed: invalid CLI symlink {bin_dir / 'keel'}", file=sys.stderr)
+        return 1
+    print(f"OK: {plugin_dir}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    ap.add_argument("--plugin-dir", help="Target plugin dir (default: ~/.gemini/config/plugins/keel)")
+    ap.add_argument("--bin-dir", help="Target CLI bin dir (default: ~/.local/bin)")
+    ap.add_argument("--no-bin", action="store_true", help="Skip symlinking keel into bin-dir")
+    ap.add_argument("--check", action="store_true", help="Verify installed symlinks without modifying disk")
+    args = ap.parse_args(argv)
+
+    plugin_dir = Path(args.plugin_dir or "~/.gemini/config/plugins/keel").expanduser()
+    bin_dir = None if args.no_bin else Path(args.bin_dir or "~/.local/bin").expanduser()
+    missing = [REPO_ROOT / n for n in (*PLUGIN_ENTRIES, "scripts/keel") if not (REPO_ROOT / n).exists()]
+    if missing:
+        raise RuntimeError(f"Missing required source path: {missing[0]}")
+    if args.check:
+        return _check(plugin_dir, bin_dir, args.plugin_dir is not None, args.bin_dir is not None)
+    if not plugin_dir.is_symlink() and plugin_dir.exists() and plugin_dir.resolve() == REPO_ROOT:
+        raise RuntimeError(f"Refusing to use repository root as --plugin-dir: {plugin_dir}")
+    if plugin_dir.is_symlink():
+        plugin_dir.unlink()
+    if plugin_dir.exists() and not plugin_dir.is_dir():
+        raise RuntimeError(f"Target plugin path is not a directory: {plugin_dir}")
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    for item in list(plugin_dir.iterdir()):
+        if item.name not in PLUGIN_ENTRIES:
+            if not item.is_symlink():
+                raise RuntimeError(f"Refusing to remove non-symlink entry: {item}")
+            item.unlink()
+    for name in PLUGIN_ENTRIES:
+        _link(REPO_ROOT / name, plugin_dir / name)
+    if bin_dir is not None:
+        if bin_dir.exists() and not bin_dir.is_dir():
+            raise RuntimeError(f"Target bin path is not a directory: {bin_dir}")
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        _link(REPO_ROOT / "scripts" / "keel", bin_dir / "keel")
+    print(f"Installed keel plugin symlinks -> {plugin_dir}" + (f" (cli -> {bin_dir / 'keel'})" if bin_dir else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(f"install-plugin error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

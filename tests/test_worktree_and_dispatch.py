@@ -276,6 +276,85 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             finally:
                 EXECUTORS.pop("dummy-sdk", None)
 
+    def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
+        self.assertTrue((ROOT / "AGENTS.md").is_file())
+        installer = ROOT / "scripts" / "install-plugin"
+        expected_entries = {
+            "plugin.json",
+            "hooks.json",
+            "assets",
+            "config",
+            "hooks",
+            "rules",
+            "scripts",
+            "skills",
+            "LICENSE",
+            "README.md",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plugin_dir = tmp_path / "plugins" / "keel"
+            bin_dir = tmp_path / "bin"
+            plugin_dir.parent.mkdir(parents=True)
+            # Simulate upgrading from an existing top-level directory symlink
+            plugin_dir.symlink_to(ROOT)
+            self.assertTrue(plugin_dir.is_symlink())
+
+            # Top-level symlink must fail --check
+            chk_before = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(chk_before.returncode, 0)
+
+            subprocess.run(
+                [str(installer), "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse(plugin_dir.is_symlink())
+            self.assertTrue(plugin_dir.is_dir())
+            self.assertEqual({p.name for p in plugin_dir.iterdir()}, expected_entries)
+            for name in expected_entries:
+                entry = plugin_dir / name
+                self.assertTrue(entry.is_symlink())
+                self.assertEqual(entry.resolve(), (ROOT / name).resolve())
+            for excluded in ("AGENTS.md", "docs", "tests", ".git", ".github", ".gitignore"):
+                self.assertFalse((plugin_dir / excluded).exists())
+                self.assertFalse((plugin_dir / excluded).is_symlink())
+
+            cli_link = bin_dir / "keel"
+            self.assertTrue(cli_link.is_symlink())
+            self.assertEqual(cli_link.resolve(), (ROOT / "scripts" / "keel").resolve())
+
+            # --check passes on valid per-entry install
+            chk_ok = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(chk_ok.returncode, 0, chk_ok.stderr)
+
+            # Stale symlinks (e.g., an accidental AGENTS.md symlink) fail --check and are cleaned on re-install
+            (plugin_dir / "AGENTS.md").symlink_to(ROOT / "AGENTS.md")
+            chk_bad = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(chk_bad.returncode, 0)
+
+            subprocess.run(
+                [str(installer), "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse((plugin_dir / "AGENTS.md").exists())
+            self.assertFalse((plugin_dir / "AGENTS.md").is_symlink())
+
 
 if __name__ == "__main__":
     unittest.main()

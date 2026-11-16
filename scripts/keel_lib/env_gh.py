@@ -102,14 +102,19 @@ def run_cmd(
     check: bool = True,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        list(argv),
-        cwd=str(cwd) if cwd is not None else None,
-        env=env if env is not None else tool_env(),
-        input=input_text,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        proc = subprocess.run(
+            list(argv),
+            cwd=str(cwd) if cwd is not None else None,
+            env=env if env is not None else tool_env(),
+            input=input_text,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        if not check:
+            return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
+        raise KeelError(f"Executable not found (127): {argv[0]}") from exc
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise KeelError(f"Command failed ({proc.returncode}): {' '.join(argv)}\n{detail}".strip())
@@ -142,16 +147,19 @@ def run_process_group(
     try:
         stdin_fh = stdin_path.open("r", encoding="utf-8") if stdin_path else subprocess.DEVNULL
         try:
-            child = subprocess.Popen(
-                list(argv),
-                cwd=str(cwd) if cwd is not None else None,
-                env=env if env is not None else tool_env(),
-                stdin=stdin_fh,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
+            try:
+                child = subprocess.Popen(
+                    list(argv),
+                    cwd=str(cwd) if cwd is not None else None,
+                    env=env if env is not None else tool_env(),
+                    stdin=stdin_fh,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as exc:
+                return 127, f"Executable not found: {argv[0]} ({exc})"
             assert child.stdout is not None and child.stderr is not None
             stderr_chunks: list[str] = []
 

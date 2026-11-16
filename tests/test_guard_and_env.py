@@ -328,6 +328,11 @@ class EnvAndGhApiTests(unittest.TestCase):
         env = tool_env()
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
+        from keel_lib.env_gh import run_cmd
+        res = run_cmd(["nonexistent-keel-binary-xyz"], check=False)
+        self.assertEqual(res.returncode, 127)
+        with self.assertRaises(KeelError):
+            run_cmd(["nonexistent-keel-binary-xyz"], check=True)
 
 
 if __name__ == "__main__":

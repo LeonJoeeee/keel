@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Install Keel plugin via per-entry symlinks (excluding repo-only root AGENTS.md/docs/tests)."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ENTRIES = (
+    "plugin.json",
+    "hooks.json",
+    "assets",
+    "config",
+    "hooks",
+    "rules",
+    "scripts",
+    "skills",
+    "LICENSE",
+    "README.md",
+)
+
+
+def _link(src: Path, dst: Path) -> None:
+    if dst.is_symlink():
+        dst.unlink()
+    elif dst.exists():
+        raise RuntimeError(f"Refusing to overwrite non-symlink path: {dst}")
+    dst.symlink_to(src)
+
+
+def _valid_link(link: Path, target: Path) -> bool:
+    try:
+        return link.is_symlink() and link.resolve(strict=True) == target.resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _resolve_dest_dir(
+    raw_arg: str,
+    *,
+    allow_leaf_symlink: bool,
+    forbid_traverse: Path | None = None,
+) -> tuple[Path, set[Path]]:
+    expanded = os.path.expanduser(raw_arg)
+    if not expanded:
+        raise RuntimeError("Destination path cannot be empty")
+    trimmed = expanded.rstrip("/") or "/"
+    cur = Path("/") if trimmed.startswith("/") else Path.cwd().resolve(strict=True)
+    tokens = [t for t in trimmed.split("/") if t]
+    visited: set[Path] = {cur}
+    missing = False
+
+    for idx, tok in enumerate(tokens):
+        is_last = idx == len(tokens) - 1
+        if tok == ".":
+            continue
+        if tok == "..":
+            if missing:
+                raise RuntimeError(f"Cannot traverse '..' through non-existent directory: {cur}")
+            cur = cur.parent
+            visited.add(cur)
+            if forbid_traverse is not None and cur == forbid_traverse:
+                raise RuntimeError(f"Refusing overlapping --plugin-dir and --bin-dir at {cur}")
+            continue
+        nxt = cur / tok
+        visited.add(nxt)
+        if forbid_traverse is not None and nxt == forbid_traverse:
+            raise RuntimeError(f"Refusing overlapping --plugin-dir and --bin-dir at {nxt}")
+        if missing:
+            cur = nxt
+            continue
+        if is_last and allow_leaf_symlink:
+            return nxt, visited
+        if nxt.exists() or nxt.is_symlink():
+            resolved = nxt.resolve(strict=True)
+            if not resolved.is_dir():
+                raise RuntimeError(f"Path component is not a directory: {nxt}")
+            if forbid_traverse is not None and resolved == forbid_traverse:
+                raise RuntimeError(f"Refusing overlapping --plugin-dir and --bin-dir at {resolved}")
+            cur = resolved
+            visited.add(cur)
+        else:
+            missing = True
+            cur = nxt
+    return cur, visited
+
+
+def _check(raw_plugin: str, raw_bin: str | None) -> int:
+    try:
+        plugin_dir, _ = _resolve_dest_dir(raw_plugin, allow_leaf_symlink=True)
+        bin_dir = _resolve_dest_dir(raw_bin, allow_leaf_symlink=False)[0] if raw_bin is not None else None
+    except (RuntimeError, OSError) as exc:
+        print(f"install-plugin check failed: {exc}", file=sys.stderr)
+        return 1
+    if plugin_dir.is_symlink() or not plugin_dir.is_dir():
+        print(f"install-plugin check failed: {plugin_dir} must be a non-symlink directory", file=sys.stderr)
+        return 1
+    if {p.name for p in plugin_dir.iterdir()} != set(PLUGIN_ENTRIES):
+        print(f"install-plugin check failed: entry mismatch in {plugin_dir}", file=sys.stderr)
+        return 1
+    if not all(_valid_link(plugin_dir / n, REPO_ROOT / n) for n in PLUGIN_ENTRIES):
+        print(f"install-plugin check failed: invalid entry symlink in {plugin_dir}", file=sys.stderr)
+        return 1
+    if bin_dir is not None and not _valid_link(bin_dir / "keel", REPO_ROOT / "scripts" / "keel"):
+        print(f"install-plugin check failed: invalid CLI symlink {bin_dir / 'keel'}", file=sys.stderr)
+        return 1
+    print(f"OK: {plugin_dir}")
+    return 0
+
+
+def _preflight_targets(raw_plugin: str, raw_bin: str | None) -> tuple[Path, Path | None]:
+    plugin_dir, plugin_visited = _resolve_dest_dir(raw_plugin, allow_leaf_symlink=True)
+    if plugin_dir.is_relative_to(REPO_ROOT) or REPO_ROOT.is_relative_to(plugin_dir):
+        raise RuntimeError(f"Refusing --plugin-dir overlapping repository root: {raw_plugin}")
+    if not plugin_dir.is_symlink():
+        if plugin_dir.exists() and not plugin_dir.is_dir():
+            raise RuntimeError(f"Target plugin path is not a directory: {plugin_dir}")
+        if plugin_dir.is_dir():
+            for item in plugin_dir.iterdir():
+                if not item.is_symlink():
+                    raise RuntimeError(f"Refusing to overwrite or remove non-symlink entry: {item}")
+    bin_dir: Path | None = None
+    if raw_bin is not None:
+        bin_dir, _ = _resolve_dest_dir(raw_bin, allow_leaf_symlink=False, forbid_traverse=plugin_dir)
+        if bin_dir.is_relative_to(REPO_ROOT):
+            raise RuntimeError(f"Refusing --bin-dir inside repository root: {raw_bin}")
+        if bin_dir.is_relative_to(plugin_dir):
+            raise RuntimeError(f"Refusing --bin-dir inside --plugin-dir: {raw_bin}")
+        cli_dst = bin_dir / "keel"
+        if cli_dst in plugin_visited or plugin_dir.is_relative_to(cli_dst) or REPO_ROOT.is_relative_to(cli_dst):
+            raise RuntimeError(f"Refusing --plugin-dir colliding with CLI symlink {cli_dst}")
+        if not cli_dst.is_symlink() and cli_dst.exists():
+            raise RuntimeError(f"Refusing to overwrite non-symlink path: {cli_dst}")
+    return plugin_dir, bin_dir
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    ap.add_argument("--plugin-dir", help="Target plugin dir (default: ~/.gemini/config/plugins/keel)")
+    ap.add_argument("--bin-dir", help="Target CLI bin dir (default: ~/.local/bin)")
+    ap.add_argument("--no-bin", action="store_true", help="Skip symlinking keel into bin-dir")
+    ap.add_argument("--check", action="store_true", help="Verify installed symlinks without modifying disk")
+    args = ap.parse_args(argv)
+
+    raw_plugin = args.plugin_dir if args.plugin_dir is not None else "~/.gemini/config/plugins/keel"
+    raw_bin = None if args.no_bin else (args.bin_dir if args.bin_dir is not None else "~/.local/bin")
+    missing = [REPO_ROOT / n for n in (*PLUGIN_ENTRIES, "scripts/keel") if not (REPO_ROOT / n).exists()]
+    if missing:
+        raise RuntimeError(f"Missing required source path: {missing[0]}")
+    if args.check:
+        return _check(raw_plugin, raw_bin)
+    plugin_dir, bin_dir = _preflight_targets(raw_plugin, raw_bin)
+    if plugin_dir.is_symlink():
+        plugin_dir.unlink()
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    for item in list(plugin_dir.iterdir()):
+        if item.name not in PLUGIN_ENTRIES:
+            item.unlink()
+    for name in PLUGIN_ENTRIES:
+        _link(REPO_ROOT / name, plugin_dir / name)
+    if bin_dir is not None:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        _link(REPO_ROOT / "scripts" / "keel", bin_dir / "keel")
+    print(f"Installed keel plugin symlinks -> {plugin_dir}" + (f" (cli -> {bin_dir / 'keel'})" if bin_dir else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (RuntimeError, OSError) as exc:
+        print(f"install-plugin error: {exc}", file=sys.stderr)
+        raise SystemExit(2)

@@ -6,17 +6,11 @@ Keel keeps human attention on **first-principles core needs**, **genuine product
 
 ## Install (Antigravity Plugin)
 
-Symlink `keel` directly into `~/.gemini/config/plugins/`:
+Install per-entry plugin symlinks into `~/.gemini/config/plugins/keel` (excluding repo-only files like root `AGENTS.md` and `tests/`) and link `keel` onto your `PATH` (`~/.local/bin/keel`):
 
 ```sh
-ln -s /path/to/keel ~/.gemini/config/plugins/keel
+./scripts/install-plugin
 agy plugin validate --strict ~/.gemini/config/plugins/keel
-```
-
-Optionally symlink the CLI onto your `PATH`:
-
-```sh
-ln -sf /path/to/keel/scripts/keel ~/.local/bin/keel
 ```
 
 ## CLI Overview

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -275,6 +276,156 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertIn("Zero data corruption.", brief_sdk)
             finally:
                 EXECUTORS.pop("dummy-sdk", None)
+
+    def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
+        self.assertTrue((ROOT / "AGENTS.md").is_file())
+        installer = ROOT / "scripts" / "install-plugin"
+        expected_entries = {
+            "plugin.json",
+            "hooks.json",
+            "assets",
+            "config",
+            "hooks",
+            "rules",
+            "scripts",
+            "skills",
+            "LICENSE",
+            "README.md",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            plugin_dir = tmp_path / "plugins" / "keel"
+            bin_dir = tmp_path / "bin"
+            plugin_dir.parent.mkdir(parents=True)
+            # Simulate upgrading from an existing top-level directory symlink
+            plugin_dir.symlink_to(ROOT)
+            self.assertTrue(plugin_dir.is_symlink())
+
+            # Top-level symlink must fail --check
+            chk_before = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(chk_before.returncode, 0)
+
+            subprocess.run(
+                [str(installer), "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse(plugin_dir.is_symlink())
+            self.assertTrue(plugin_dir.is_dir())
+            self.assertEqual({p.name for p in plugin_dir.iterdir()}, expected_entries)
+            for name in expected_entries:
+                entry = plugin_dir / name
+                self.assertTrue(entry.is_symlink())
+                self.assertEqual(entry.resolve(), (ROOT / name).resolve())
+            for excluded in ("AGENTS.md", "docs", "tests", ".git", ".github", ".gitignore"):
+                self.assertFalse((plugin_dir / excluded).exists())
+                self.assertFalse((plugin_dir / excluded).is_symlink())
+
+            cli_link = bin_dir / "keel"
+            self.assertTrue(cli_link.is_symlink())
+            self.assertEqual(cli_link.resolve(), (ROOT / "scripts" / "keel").resolve())
+
+            # --check passes on valid per-entry install
+            chk_ok = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(chk_ok.returncode, 0, chk_ok.stderr)
+
+            # Stale symlinks (e.g., an accidental AGENTS.md symlink) fail --check and are cleaned on re-install
+            (plugin_dir / "AGENTS.md").symlink_to(ROOT / "AGENTS.md")
+            chk_bad = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(chk_bad.returncode, 0)
+
+            subprocess.run(
+                [str(installer), "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse((plugin_dir / "AGENTS.md").exists())
+            self.assertFalse((plugin_dir / "AGENTS.md").is_symlink())
+
+            # Default mode (no --plugin-dir / --bin-dir flags) must strictly validate resolved symlink targets
+            fake_home = tmp_path / "home"
+            fake_home.mkdir()
+            home_env = {**os.environ, "HOME": str(fake_home)}
+            subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
+
+            default_ok = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertEqual(default_ok.returncode, 0, default_ok.stderr)
+
+            # Mispointing a plugin entry (hooks -> assets) must fail default --check
+            default_plugin_dir = fake_home / ".gemini" / "config" / "plugins" / "keel"
+            (default_plugin_dir / "hooks").unlink()
+            (default_plugin_dir / "hooks").symlink_to(ROOT / "assets")
+            bad_entry_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertNotEqual(bad_entry_chk.returncode, 0)
+
+            # Restore valid plugin entries, then mispoint CLI symlink (keel -> LICENSE) -> must fail default --check
+            subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
+            default_cli = fake_home / ".local" / "bin" / "keel"
+            default_cli.unlink()
+            default_cli.symlink_to(ROOT / "LICENSE")
+            bad_cli_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertNotEqual(bad_cli_chk.returncode, 0)
+
+            # Overlapping --plugin-dir and --bin-dir must be rejected before modifying disk
+            clean_plug = tmp_path / "overlap-plug"
+            for bad_plug, bad_bin in (
+                (clean_plug, clean_plug),
+                (clean_plug, clean_plug / "bin"),
+                (tmp_path / "shared" / "keel", tmp_path / "shared"),
+            ):
+                overlap = subprocess.run(
+                    [str(installer), "--plugin-dir", str(bad_plug), "--bin-dir", str(bad_bin)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(overlap.returncode, 2)
+                self.assertFalse(bad_plug.exists())
+                self.assertFalse(bad_bin.exists())
+
+            # POSIX symlink + '..' resolution: logical/alias -> physical/child makes logical/alias/../plugin == physical/plugin
+            logical = tmp_path / "logical"
+            physical_child = tmp_path / "physical" / "child"
+            logical.mkdir()
+            physical_child.mkdir(parents=True)
+            (logical / "alias").symlink_to(physical_child)
+            sym_dotdot_overlap = subprocess.run(
+                [
+                    str(installer),
+                    "--plugin-dir",
+                    f"{logical}/alias/../plugin",
+                    "--bin-dir",
+                    str(tmp_path / "physical" / "plugin"),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(sym_dotdot_overlap.returncode, 2)
+            self.assertFalse((tmp_path / "physical" / "plugin").exists())
+
+            # POSIX symlink + '..' into REPO_ROOT must also be blocked by repository-root boundary preflight
+            (logical / "repo_alias").symlink_to(ROOT / "scripts")
+            for repo_escape in (f"{logical}/repo_alias/..", f"{logical}/repo_alias/../sub"):
+                repo_guard = subprocess.run(
+                    [str(installer), "--plugin-dir", repo_escape, "--no-bin"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(repo_guard.returncode, 2)
+            self.assertFalse((ROOT / "sub").exists())
 
 
 if __name__ == "__main__":

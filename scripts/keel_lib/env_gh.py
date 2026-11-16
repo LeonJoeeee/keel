@@ -111,12 +111,15 @@ def run_cmd(
             text=True,
             capture_output=True,
         )
-    except FileNotFoundError as exc:
+    except OSError as exc:
         if cwd is not None and not os.path.isdir(cwd):
-            message = f"Working directory (cwd) not found (127): {cwd}"
+            problem = "not found" if isinstance(exc, FileNotFoundError) else "invalid"
+            message = f"Working directory (cwd) {problem} (127): {cwd} ({exc})"
             if not check:
                 return subprocess.CompletedProcess(list(argv), 127, "", message)
             raise KeelError(message) from exc
+        if not isinstance(exc, FileNotFoundError):
+            raise
         if not check:
             return subprocess.CompletedProcess(list(argv), 127, "", str(exc))
         raise KeelError(f"Executable not found (127): {argv[0]}") from exc
@@ -163,9 +166,12 @@ def run_process_group(
                     text=True,
                     start_new_session=True,
                 )
-            except FileNotFoundError as exc:
+            except OSError as exc:
                 if cwd is not None and not os.path.isdir(cwd):
-                    return 127, f"Working directory (cwd) not found: {cwd} ({exc})"
+                    problem = "not found" if isinstance(exc, FileNotFoundError) else "invalid"
+                    return 127, f"Working directory (cwd) {problem}: {cwd} ({exc})"
+                if not isinstance(exc, FileNotFoundError):
+                    raise
                 return 127, f"Executable not found: {argv[0]} ({exc})"
             assert child.stdout is not None and child.stderr is not None
             stderr_chunks: list[str] = []

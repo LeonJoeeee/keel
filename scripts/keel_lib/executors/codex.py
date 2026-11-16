@@ -117,10 +117,16 @@ class CodexExecutor(ExecutorAdapter):
         effort: str | None,
         defaults: dict[str, Any],
     ) -> tuple[str, str]:
-        cfg = defaults.get("executors", {}).get("codex", {})
-        preset_cfg = cfg.get("presets", {}).get(preset, cfg.get("presets", {}).get("general", {}))
-        resolved_model = model or preset_cfg.get("model", "gpt-6.1-sol")
-        resolved_effort = effort or preset_cfg.get("effort", "high")
+        cfg = (defaults.get("executors") or {}).get("codex") or {}
+        presets = cfg.get("presets") or {}
+        preset_cfg = presets.get(preset) or presets.get("general") or {}
+        default_effort = "xhigh" if preset in ("implement", "verify") else "high"
+        clean_model = model.strip() if isinstance(model, str) else ""
+        clean_effort = effort.strip() if isinstance(effort, str) else ""
+        resolved_model = clean_model if clean_model and clean_model != "inherit" else preset_cfg.get("model", "gpt-6.1-sol")
+        resolved_effort = (
+            clean_effort if clean_effort and clean_effort != "inherit" else preset_cfg.get("effort", default_effort)
+        )
         return resolved_model, resolved_effort
 
     def build_exec_argv(
@@ -137,9 +143,11 @@ class CodexExecutor(ExecutorAdapter):
         ephemeral: bool = False,
         resume_session_id: str | None = None,
     ) -> list[str]:
-        sub_cfg = defaults.get("executors", {}).get("codex", {}).get("subagent_default", {})
-        sub_model = sub_cfg.get("model", "gpt-6.1-terra")
-        sub_effort = sub_cfg.get("effort", "high")
+        sub_cfg = ((defaults.get("executors") or {}).get("codex") or {}).get("subagent_default") or {}
+        raw_sub_model = str(sub_cfg.get("model") or "inherit").strip()
+        raw_sub_effort = str(sub_cfg.get("effort") or "inherit").strip()
+        sub_model = model if raw_sub_model in ("", "inherit") else raw_sub_model
+        sub_effort = effort if raw_sub_effort in ("", "inherit") else raw_sub_effort
 
         # Top-level options MUST precede `resume` in codex-cli 0.169+
         argv: list[str] = [

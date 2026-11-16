@@ -25,12 +25,12 @@
         },
         "verify": {
           "model": "gpt-6.1-sol",
-          "effort": "high"
+          "effort": "xhigh"
         }
       },
       "subagent_default": {
-        "model": "gpt-6.1-terra",
-        "effort": "high"
+        "model": "inherit",
+        "effort": "inherit"
       }
     },
     "agy": {

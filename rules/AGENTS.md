@@ -19,5 +19,6 @@ Apply these principles when working in software repositories; stay completely ou
 
 ## 4. On-demand workflow skills (load only when needed)
 - **Parallel or isolated subagent execution** (built-in Antigravity, Codex CLI, or worktree management): activate skill `keel-dispatch`.
+- **Direct Antigravity `invoke_subagent` calls:** Use `TypeName="self"` with `Model="inherit"` for research, judgment, implementation, and verification (`Model="flash"` only for trivial mechanical subtasks); never use `TypeName="research"` (its host sandbox strips network and MCP access).
 - **Independent verification, PR review convergence, or merging to the default branch**: activate skill `keel-integrate`.
 - **Founding/adopting a repository, writing repo `AGENTS.md`, recording ADRs, or deploying**: activate skill `keel-repo-ops`.

@@ -31,21 +31,24 @@ def _link(src: Path, dst: Path) -> None:
     dst.symlink_to(src)
 
 
-def _valid_link(link: Path, target: Path, strict: bool) -> bool:
-    return link.is_symlink() and link.exists() and (not strict or link.resolve() == target.resolve())
+def _valid_link(link: Path, target: Path) -> bool:
+    try:
+        return link.is_symlink() and link.resolve(strict=True) == target.resolve(strict=True)
+    except OSError:
+        return False
 
 
-def _check(plugin_dir: Path, bin_dir: Path | None, strict_plugin: bool, strict_bin: bool) -> int:
+def _check(plugin_dir: Path, bin_dir: Path | None) -> int:
     if plugin_dir.is_symlink() or not plugin_dir.is_dir():
         print(f"install-plugin check failed: {plugin_dir} must be a non-symlink directory", file=sys.stderr)
         return 1
     if {p.name for p in plugin_dir.iterdir()} != set(PLUGIN_ENTRIES):
         print(f"install-plugin check failed: entry mismatch in {plugin_dir}", file=sys.stderr)
         return 1
-    if not all(_valid_link(plugin_dir / n, REPO_ROOT / n, strict_plugin) for n in PLUGIN_ENTRIES):
+    if not all(_valid_link(plugin_dir / n, REPO_ROOT / n) for n in PLUGIN_ENTRIES):
         print(f"install-plugin check failed: invalid entry symlink in {plugin_dir}", file=sys.stderr)
         return 1
-    if bin_dir is not None and not _valid_link(bin_dir / "keel", REPO_ROOT / "scripts" / "keel", strict_bin):
+    if bin_dir is not None and not _valid_link(bin_dir / "keel", REPO_ROOT / "scripts" / "keel"):
         print(f"install-plugin check failed: invalid CLI symlink {bin_dir / 'keel'}", file=sys.stderr)
         return 1
     print(f"OK: {plugin_dir}")
@@ -66,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         raise RuntimeError(f"Missing required source path: {missing[0]}")
     if args.check:
-        return _check(plugin_dir, bin_dir, args.plugin_dir is not None, args.bin_dir is not None)
+        return _check(plugin_dir, bin_dir)
     if not plugin_dir.is_symlink() and plugin_dir.exists() and plugin_dir.resolve() == REPO_ROOT:
         raise RuntimeError(f"Refusing to use repository root as --plugin-dir: {plugin_dir}")
     if plugin_dir.is_symlink():

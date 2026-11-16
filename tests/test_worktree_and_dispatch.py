@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -354,6 +355,30 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             )
             self.assertFalse((plugin_dir / "AGENTS.md").exists())
             self.assertFalse((plugin_dir / "AGENTS.md").is_symlink())
+
+            # Default mode (no --plugin-dir / --bin-dir flags) must strictly validate resolved symlink targets
+            fake_home = tmp_path / "home"
+            fake_home.mkdir()
+            home_env = {**os.environ, "HOME": str(fake_home)}
+            subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
+
+            default_ok = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertEqual(default_ok.returncode, 0, default_ok.stderr)
+
+            # Mispointing a plugin entry (hooks -> assets) must fail default --check
+            default_plugin_dir = fake_home / ".gemini" / "config" / "plugins" / "keel"
+            (default_plugin_dir / "hooks").unlink()
+            (default_plugin_dir / "hooks").symlink_to(ROOT / "assets")
+            bad_entry_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertNotEqual(bad_entry_chk.returncode, 0)
+
+            # Restore valid plugin entries, then mispoint CLI symlink (keel -> LICENSE) -> must fail default --check
+            subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
+            default_cli = fake_home / ".local" / "bin" / "keel"
+            default_cli.unlink()
+            default_cli.symlink_to(ROOT / "LICENSE")
+            bad_cli_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
+            self.assertNotEqual(bad_cli_chk.returncode, 0)
 
 
 if __name__ == "__main__":

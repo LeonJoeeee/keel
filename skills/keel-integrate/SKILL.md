@@ -1,46 +1,59 @@
 ---
 name: keel-integrate
 description: >-
-  Use when verifying pull requests or branches in a clean context, handling review convergence, checking pure-rebase tree equivalence, or merging changes into a protected default branch.
+  Use when verifying local task branches in a clean disposable clone, handling review convergence, proving pure-rebase git-tree equivalence, or landing/discarding branches on a protected default branch.
 ---
 
-# Keel Integrate — Independent Verification & Guarded Merge
+# Keel Integrate — Pure-Git Branch Verification & Guarded Landing
 
 Resolve `<keel>` as this plugin's root directory (`../../scripts/keel`).
 
-## 1. Upstream checks before review
-Before commissioning independent verification, ensure `git status --porcelain -uall` is clean in the author worktree and required CI / local test suites pass without weakened assertions or masked symptoms.
+## 1. Upstream checks before verification
+Ensure `git status --porcelain -uall` is completely clean in the author worktree and local test/lint suites pass without weakened assertions or masked symptoms.
 
-## 2. Clean-context active verification (`keel pr verify`)
-Every PR to the default branch requires independent verification from a fresh session that did not author the code (works with or without a GitHub Issue, including small fixes and Dependabot PRs):
-
-```sh
-# Codex verifier (runs in disposable /tmp clone, enforces verdict.schema.json, optionally posts clean PR comment)
-<keel>/scripts/keel pr verify <pr_number> --project <repo_dir> [--executor codex] [--why "..."] --publish
-
-# Built-in Antigravity verifier (prepares disposable /tmp clone + file-pointer spawn spec)
-<keel>/scripts/keel pr verify <pr_number> --project <repo_dir> --executor agy [--why "..."]
-# After the native subagent writes verdict.json, publish and clean up:
-<keel>/scripts/keel pr publish-verdict <pr_number> --project <repo_dir> --verdict-file <path> --head-sha <sha> --executor agy
-```
-
-### Convergence rules (`Blocking` vs `Notes`)
-- **`blocking` items:** Real defects, regressions, scope/safety violations, or `Core need` drift. Fix in the author lane and re-verify. Items prefixed `[Needs human decision]` escalate immediately to the human.
-- **`notes` items:** Non-blocking observations. Never block approval or trigger another fix/review loop.
-- **2-round circuit breaker:** If 2 fix rounds fail to converge (`keel pr status <pr_number>`), stop looping and escalate to the human to reshape direction or authorize `--human-override`.
-
-## 3. Guarded integration (`keel pr merge`)
-Raw `gh pr merge` is blocked by `hooks/pre-tool-use`. Always check gate readiness via `keel pr merge` (add `--execute` **only** when the human has authorized merging this PR or granted `delegated` merge authority):
+## 2. Clean-context active verification (`keel branch verify`)
+Every branch landing onto `main`/`master` requires independent verification in a remote-stripped disposable `/tmp` clone (`verdict.schema.json` enforced, recorded in `.git/keel-state/branches/`, checking against `main`'s locked task spec + a 1-line Canary mutation check against fake-green tests):
 
 ```sh
-# Dry-run gate check (ancestry, skipped-aware CI, and matching Approve verdict)
-<keel>/scripts/keel pr merge <pr_number> --project <repo_dir>
+# Default cross-model Codex verifier (gpt-6-astra @ max, runs synchronously in disposable /tmp clone)
+<keel>/scripts/keel branch verify <slug_or_branch> --project <repo_dir> [--check "<test_cmd>"]
 
-# Pure rebase onto advanced main without re-running LLM review (proves exact git tree equality)
-<keel>/scripts/keel pr merge <pr_number> --project <repo_dir> --old-base <OLD_BASE> --old-head <OLD_HEAD> [--execute]
+# High-stakes dual verification (both Codex gpt-6-astra @ max AND built-in Antigravity must approve)
+# Option A: launch both verifiers concurrently in parallel (recommended for speed — joins the same locked dual round):
+<keel>/scripts/keel branch verify <slug_or_branch> --project <repo_dir> --dual --executor agy
+<keel>/scripts/keel branch verify <slug_or_branch> --project <repo_dir> --dual --executor codex [--check "<test_cmd>"]
+# Option B: single combined command (prepares agy descriptor first, then runs codex synchronously):
+<keel>/scripts/keel branch verify <slug_or_branch> --project <repo_dir> --dual [--check "<test_cmd>"]
 
-# Human-authorized direct merge override (only with explicit human words)
-<keel>/scripts/keel pr merge <pr_number> --project <repo_dir> --human-override "<exact authorization & reason>" --execute
+# Built-in Antigravity verifier standalone (returns invoke_subagent descriptor + disposable /tmp clone)
+<keel>/scripts/keel branch verify <slug_or_branch> --project <repo_dir> --executor agy
+# After the agy subagent writes verdict.json, record it and clean up the disposable clone:
+<keel>/scripts/keel branch record-verdict <slug_or_branch> \
+  --project <repo_dir> --verdict-file <path> --head-sha <sha> --executor agy --cleanup-scratch <dir>
 ```
 
-After merge, clean up any local worktree (`keel worktree cleanup <slug> --project <repo_dir> --pr <pr_number>`).
+### Convergence rules (`blocking` vs `notes`)
+- **`blocking` items:** Real defects, Canary-surviving fake-green tests, weakened `main`-locked task bounds, regressions, or `Core need` drift. Fix in the author worktree and re-verify. Items prefixed `[Needs human decision]` escalate immediately to the human.
+- **`notes` items:** Non-blocking observations or out-of-scope follow-ups (open in `docs/tasks/todo/` on `main` if warranted). Never block approval or trigger another review loop.
+- **2-round circuit breaker:** After 2 `request_changes` rounds (`keel branch status <slug_or_branch>`), stop looping and escalate to the human (in `--dual`, a dual pass on one commit counts as 1 round).
+
+## 3. Guarded local landing & discard (`keel branch land`)
+Direct `git merge` / `git rebase` / non-`docs/tasks/` `git commit` on `main` is blocked by `hooks/pre-tool-use`. Inspect readiness with `keel branch status` or dry-run `keel branch land`; pass `--execute` or `--discard` **only** with explicit human authorization (or standing delegation):
+
+```sh
+# Inspect repo-wide todo/active tasks & worktrees, or a specific branch's gate status
+<keel>/scripts/keel branch status [<slug_or_branch>] --project <repo_dir>
+
+# Dry-run landing check (default strategy: atomic --squash bundling active -> archive task move)
+<keel>/scripts/keel branch land <slug_or_branch> --project <repo_dir>
+
+# Human-authorized atomic squash land (or pass --ff-only for fast-forward + archive commit)
+<keel>/scripts/keel branch land <slug_or_branch> --project <repo_dir> [--squash|--ff-only] --execute
+
+# Pure rebase onto advanced main without re-running LLM verification (re-run --check if prior head had checks)
+<keel>/scripts/keel branch land <slug_or_branch> \
+  --project <repo_dir> --old-base <OLD_BASE> --old-head <OLD_HEAD> [--check "<test_cmd>"] --execute
+
+# Human-authorized discard (archives task with Outcome: [DISCARDED] on main, removes worktree + branch)
+<keel>/scripts/keel branch land <slug_or_branch> --project <repo_dir> --discard --reason "<why>"
+```

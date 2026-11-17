@@ -9,12 +9,13 @@ import shlex
 from typing import Any
 
 from .. import KeelError, PLUGIN_ROOT
-from ..env_gh import run_cmd, run_process_group, same_path, tool_env
+from ..env import run_cmd, run_process_group, same_path, tool_env
 from ..worktree import git_dirs
 from .base import ExecutorAdapter, RunRequest
 
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+VALID_CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write", "danger-full-access"})
 
 
 def discover_mcp_approval_flags(workdir: Path) -> list[str]:
@@ -108,6 +109,7 @@ def extract_session_id_from_event(line: str) -> str | None:
 class CodexExecutor(ExecutorAdapter):
     name = "codex"
     native_agent_docs = ("AGENTS.md",)
+    loads_plugin_spine = False
     inject_schema_in_brief = False  # Enforced natively via `codex exec --output-schema`
 
     def _resolve_model_effort(
@@ -120,13 +122,12 @@ class CodexExecutor(ExecutorAdapter):
         cfg = (defaults.get("executors") or {}).get("codex") or {}
         presets = cfg.get("presets") or {}
         preset_cfg = presets.get(preset) or presets.get("general") or {}
-        default_effort = "xhigh" if preset in ("implement", "verify") else "high"
         clean_model = model.strip() if isinstance(model, str) else ""
         clean_effort = effort.strip() if isinstance(effort, str) else ""
-        resolved_model = clean_model if clean_model and clean_model != "inherit" else preset_cfg.get("model", "gpt-6.1-sol")
-        resolved_effort = (
-            clean_effort if clean_effort and clean_effort != "inherit" else preset_cfg.get("effort", default_effort)
+        resolved_model = (
+            clean_model if clean_model and clean_model != "inherit" else preset_cfg.get("model", "gpt-6-astra")
         )
+        resolved_effort = clean_effort if clean_effort and clean_effort != "inherit" else preset_cfg.get("effort", "max")
         return resolved_model, resolved_effort
 
     def build_exec_argv(
@@ -142,7 +143,20 @@ class CodexExecutor(ExecutorAdapter):
         extra_git_dirs: tuple[Path, ...] = (),
         ephemeral: bool = False,
         resume_session_id: str | None = None,
+        sandbox_mode: str | None = None,
+        allow_disposable_write: bool = False,
     ) -> list[str]:
+        if sandbox_mode is not None:
+            effective_sandbox = sandbox_mode
+        elif mode == "read" and not allow_disposable_write:
+            effective_sandbox = "read-only"
+        else:
+            effective_sandbox = "workspace-write"
+        if effective_sandbox not in VALID_CODEX_SANDBOX_MODES:
+            raise KeelError(
+                f"Invalid Codex sandbox mode '{effective_sandbox}'. Valid choices: {sorted(VALID_CODEX_SANDBOX_MODES)}"
+            )
+
         sub_cfg = ((defaults.get("executors") or {}).get("codex") or {}).get("subagent_default") or {}
         raw_sub_model = str(sub_cfg.get("model") or "inherit").strip()
         raw_sub_effort = str(sub_cfg.get("effort") or "inherit").strip()
@@ -154,23 +168,28 @@ class CodexExecutor(ExecutorAdapter):
             "codex",
             "exec",
             "-s",
-            "workspace-write",
+            effective_sandbox,
             "-C",
             str(workdir),
-            *resolve_git_add_dirs(workdir, extra_git_dirs),
-            "-c",
-            "sandbox_workspace_write.network_access=true",
-            "-m",
-            model,
-            "-c",
-            f'model_reasoning_effort="{effort}"',
-            "-c",
-            f'agents.default_subagent_model="{sub_model}"',
-            "-c",
-            f'agents.default_subagent_reasoning_effort="{sub_effort}"',
-            *inline_hook_flags(),
-            *discover_mcp_approval_flags(workdir),
         ]
+        if effective_sandbox == "workspace-write":
+            argv.extend(resolve_git_add_dirs(workdir, extra_git_dirs))
+            argv.extend(["-c", "sandbox_workspace_write.network_access=true"])
+
+        argv.extend(
+            [
+                "-m",
+                model,
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "-c",
+                f'agents.default_subagent_model="{sub_model}"',
+                "-c",
+                f'agents.default_subagent_reasoning_effort="{sub_effort}"',
+                *inline_hook_flags(),
+                *discover_mcp_approval_flags(workdir),
+            ]
+        )
 
         in_git = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=workdir, check=False).returncode == 0
         if not in_git:
@@ -200,6 +219,7 @@ class CodexExecutor(ExecutorAdapter):
             schema_path=req.schema_path,
             extra_git_dirs=req.extra_git_dirs,
             ephemeral=ephemeral,
+            allow_disposable_write=req.scratch_verify,
         )
         events_path = req.run_dir / "events.jsonl"
         session_id: str | None = None
@@ -233,6 +253,7 @@ class CodexExecutor(ExecutorAdapter):
             "output_path": str(req.output_path),
             "events_path": str(events_path),
             "extra_git_dirs": [str(p) for p in req.extra_git_dirs],
+            "scratch_verify": req.scratch_verify,
             "output_preview": final_text[:1000],
         }
 
@@ -265,6 +286,7 @@ class CodexExecutor(ExecutorAdapter):
             schema_path=schema_path,
             extra_git_dirs=extra_dirs,
             resume_session_id=session_id,
+            allow_disposable_write=bool(record.get("scratch_verify")),
         )
 
         events_path = run_dir / "events-resume.jsonl"

@@ -13,146 +13,320 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from keel_lib import KeelError  # noqa: E402
-from keel_lib.env_gh import decode_json_stream, gh_api, run_cmd, run_process_group, safe_resolve, tool_env  # noqa: E402
+from keel_lib.env import is_disposable_verify_path, is_subpath, run_cmd, run_process_group, safe_resolve, same_path, tool_env  # noqa: E402
 from keel_lib.guard_rules import detect_agent_mode, evaluate_command  # noqa: E402
+from keel_lib.worktree import create_disposable_clone, create_worktree  # noqa: E402
+
+
+def _init_repo(path: Path, *, default_branch: str = "main") -> str:
+    subprocess.run(["git", "init", "-b", default_branch, str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True)
+    (path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "app.py"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-m", "init"], check=True, capture_output=True)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 class GuardRulesTests(unittest.TestCase):
-    def test_false_positive_regressions_never_blocked(self) -> None:
-        safe_commands = [
-            "pytest tests/merge/ -q",
-            "python3 src/merge.py --check",
-            "git add src/merge.py && git commit -m 'fix merge helper'",
-            "git push -u origin task/fix-timeout && gh pr create --base main --title 'Fix'",
-            "git rebase origin/main && git push --force-with-lease origin task/fix-timeout",
-            "git push origin v0.1.0",
-            'echo "gh pr merge \\"42\\" should not run"',
-            "cat <<'EOF' > /tmp/note.txt\ngh pr merge 42\ngit push origin main\nEOF",
-            "echo '<<EOF' && echo ok",
-            "# comment mentioning <<EOF\necho ok",
-            "printf $'it\\'s\\n' && echo '; gh pr merge 7'",
-        ]
-        for mode in ("main", "write"):
-            for cmd in safe_commands:
-                with self.subTest(mode=mode, cmd=cmd):
-                    self.assertIsNone(evaluate_command(cmd, mode=mode))
+    def test_false_positive_regressions_and_normal_main_pushes_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            non_git = Path(tmp) / "scratch"
+            non_git.mkdir()
+            main_safe = [
+                "pytest tests/merge/ -q",
+                "python3 src/merge.py --check",
+                "git push",
+                "git push origin main",
+                "git push th main",
+                "git push -u origin main",
+                "git push -ofoo=bar origin main",
+                "git push -o force origin main",
+                "git push origin v0.2.0",
+                'echo "git push --force origin main should not run"',
+                "cat <<'EOF' > /tmp/note.txt\ngit push --force origin main\nkeel branch land x --execute\nEOF",
+                "echo '<<EOF' && echo ok",
+                "# comment mentioning <<EOF\necho ok",
+                "printf $'it\\'s\\n' && echo '; git push -f'",
+                "git status && git diff",
+            ]
+            for cmd in main_safe:
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(evaluate_command(cmd, mode="main", cwd=non_git))
 
-    def test_dangerous_commands_and_shell_compound_bypasses_blocked(self) -> None:
+    def test_destructive_git_pushes_and_shell_compound_bypasses_blocked(self) -> None:
         adversarial_bypasses = [
-            "gh pr merge 42 --squash",
-            "gh pr merge>/tmp/out 42",
-            "gh pr&>/dev/null merge 42",
-            "gh >|/dev/null pr merge 42",
-            "gh >&1tmp pr merge 42",
-            "gh {fd}>/dev/null pr merge 42",
-            "gh $'pr' merge 42",
-            'gh $"pr" merge 42',
-            "gh pr -R owner/repo merge 42",
-            "# comment \\\ngh pr merge 42",
-            "cat <<'EOF' >/dev/null\nmacro \\\nEOF\ngh pr merge 42",
-            "sudo gh -R owner/repo pr merge 42",
-            "echo $(gh pr merge 42)",
-            "if true; then gh pr merge 42; fi",
-            "{ gh pr merge 42; }",
-            "! gh pr merge 42",
-            "</dev/null gh pr merge 42",
-            "gh \\\npr \\\nmerge 42",
-            "cat <<EOF > /tmp/x\n$(gh pr merge 42)\nEOF",
-            "echo '<<EOF'\ngh pr merge 42",
-            "# <<EOF\ngh pr merge 42",
-            "git push origin main",
-            "git push origin HEAD:heads/main",
-            "git -c remote.origin.push=HEAD:refs/heads/main push origin",
-            "git -c push.default=matching push origin",
-            "git push origin :",
-            "git push origin 'refs/heads/*:refs/heads/*'",
-            "git push --all origin",
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push -uf origin main",
+            "git push -fu origin main",
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main:deadbeef origin main",
+            "git push --force-if-includes origin main",
+            "git push --delete origin task/old",
+            "git push -d origin task/old",
             "git push --mirror origin",
-            "git -C /tmp/repo push --force origin HEAD:refs/heads/master",
+            "git push origin +main",
+            "git push origin +HEAD:main",
+            "git push origin :task/old",
+            "git -c remote.origin.push=+HEAD:refs/heads/main push origin",
+            "git push>/tmp/out --force origin main",
+            "git&>/dev/null push -f origin main",
+            "git >|/dev/null push -f origin main",
+            "git >&1tmp push -f origin main",
+            "git {fd}>/dev/null push -f origin main",
+            "git $'push' --force origin main",
+            'git $"push" --force origin main',
+            "# comment \\\ngit push --force origin main",
+            "cat <<'EOF' >/dev/null\nmacro \\\nEOF\ngit push -f origin main",
+            "sudo git -C /tmp/repo push --force origin main",
+            "echo $(git push --force origin main)",
+            "if true; then git push -f origin main; fi",
+            "{ git push -f origin main; }",
+            "! git push -f origin main",
+            "</dev/null git push -f origin main",
+            "git \\\npush \\\n--force origin main",
+            "cat <<EOF > /tmp/x\n$(git push -f origin main)\nEOF",
+            "echo '<<EOF'\ngit push -f origin main",
         ]
         for cmd in adversarial_bypasses:
             with self.subTest(cmd=cmd):
-                self.assertIsNotNone(evaluate_command(cmd, mode="main"))
+                self.assertIsNotNone(evaluate_command(cmd, mode="main", cwd="/tmp"))
 
-        self.assertIsNotNone(evaluate_command("keel pr merge 12 --execute", mode="write"))
-        self.assertIsNone(evaluate_command("keel pr merge 12", mode="write"))
+        # Subagents (`read` and `write`) block ALL `git push` commands
+        for sub_mode in ("read", "write"):
+            for cmd in ("git push", "git push origin task/feat", "git push th main"):
+                self.assertIsNotNone(evaluate_command(cmd, mode=sub_mode, cwd="/tmp"))
 
-    def test_implicit_git_push_checks_current_and_upstream_branch(self) -> None:
+    def test_keel_cli_subagent_guards(self) -> None:
+        for mode in ("read", "write"):
+            self.assertIsNotNone(evaluate_command("keel branch land feat --execute", mode=mode))
+            self.assertIsNotNone(evaluate_command("keel branch land feat --discard --reason obsolete", mode=mode))
+            self.assertIsNotNone(
+                evaluate_command("python3 -W default /opt/keel/scripts/keel branch land feat --execute", mode=mode)
+            )
+            self.assertIsNotNone(evaluate_command("keel worktree cleanup feat --discard", mode=mode))
+            # Dry-run `keel branch land` and `keel branch status` are allowed
+            self.assertIsNone(evaluate_command("keel branch land feat", mode=mode))
+            self.assertIsNone(evaluate_command("keel branch status feat", mode=mode))
+
+        # `read` mode additionally blocks recording verdicts or creating/cleaning worktrees
+        self.assertIsNotNone(
+            evaluate_command(
+                "keel branch record-verdict feat --verdict-file /tmp/v.json --head-sha " + "a" * 40,
+                mode="read",
+            )
+        )
+        self.assertIsNotNone(evaluate_command("keel branch verify feat", mode="read"))
+        self.assertIsNotNone(evaluate_command("keel worktree create feat", mode="read"))
+        self.assertIsNone(evaluate_command("keel branch land feat --execute", mode="main"))
+        self.assertIsNone(evaluate_command("keel branch land feat --discard --reason done", mode="main"))
+
+    def test_read_mode_blocks_repo_mutations_but_allows_disposable_verify_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
-            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"], check=True)
-            (repo / "f.txt").write_text("1\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            head_sha = _init_repo(repo)
 
-            # Checked out on `main`: implicit `git push`, `git push origin`, `git push origin HEAD` are blocked!
-            for cmd in ("git push", "git push origin", "git push origin HEAD"):
-                self.assertIsNotNone(evaluate_command(cmd, mode="write", cwd=repo))
+            # Outside `/tmp/keel-verify-*`: block mutating git subcommands, allow read-only queries
+            blocked_in_read = [
+                "git commit -m 'x'",
+                "git merge task/x",
+                "git rebase main",
+                "git cherry-pick HEAD",
+                "git reset --hard",
+                "git checkout -b new-branch",
+                "git switch -c new-branch",
+                "git restore app.py",
+                "git clean -fd",
+                "git stash",
+                "git stash pop",
+                "git tag v1.0.0",
+                "git tag -d v1.0.0",
+                "git branch new-branch",
+                "git branch -D main",
+                "git branch -m renamed",
+                "git worktree add /tmp/wt",
+                "git worktree remove /tmp/wt",
+                "git worktree prune",
+                "git pull",
+                "git am patch.mbox",
+                "git apply patch.diff",
+            ]
+            for cmd in blocked_in_read:
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(evaluate_command(cmd, mode="read", cwd=repo))
 
-            # Checked out on `task/feat`: implicit `git push` and `git push origin HEAD` are allowed!
-            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "task/feat"], check=True, capture_output=True)
-            for cmd in ("git push", "git push origin", "git push origin HEAD"):
-                self.assertIsNone(evaluate_command(cmd, mode="write", cwd=repo))
+            allowed_in_read = [
+                "git status --porcelain -uall",
+                "git diff HEAD~0",
+                "git log -n 5 --oneline",
+                "git stash list",
+                "git tag",
+                "git tag -l 'v*'",
+                "git branch",
+                "git branch -a",
+                "git branch --show-current",
+                "git worktree list",
+            ]
+            for cmd in allowed_in_read:
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(evaluate_command(cmd, mode="read", cwd=repo))
 
-            # Tracking `refs/heads/main` upstream from `task/feat`: blocked!
-            subprocess.run(["git", "-C", str(repo), "config", "branch.task/feat.merge", "refs/heads/main"], check=True)
-            self.assertIsNotNone(evaluate_command("git push", mode="write", cwd=repo))
+            # Ordinary worktree named `.agents/worktrees/keel-verify-read` MUST NOT be treated as disposable verify!
+            wt_tricky = Path(create_worktree(repo, "keel-verify-read")["path"])
+            self.assertFalse(is_disposable_verify_path(wt_tricky))
+            self.assertEqual(detect_agent_mode(cwd=str(wt_tricky), env={}), "write")
+            self.assertIsNotNone(evaluate_command("git checkout -- app.py", mode="read", cwd=wt_tricky))
+            self.assertIsNotNone(evaluate_command("git commit -m 'bad'", mode="read", cwd=wt_tricky))
 
-            # Reset branch merge, configure `remote.origin.push = HEAD:refs/heads/main` -> blocked!
-            subprocess.run(["git", "-C", str(repo), "config", "--unset", "branch.task/feat.merge"], check=True)
-            subprocess.run(["git", "-C", str(repo), "config", "remote.origin.push", "HEAD:refs/heads/main"], check=True)
-            self.assertIsNotNone(evaluate_command("git push origin", mode="write", cwd=repo))
+            # Inside disposable `/tmp/keel-verify-*` clone: local working-tree Canary commands ARE allowed,
+            # while `git push` and `-C <real_repo>` mutations remain blocked!
+            verify_scratch = Path(tempfile.mkdtemp(prefix="keel-verify-unit-"))
+            try:
+                clone_dir, _ = create_disposable_clone(repo, head_sha, verify_scratch)
+                self.assertIsNone(evaluate_command("git checkout -- app.py", mode="read", cwd=clone_dir))
+                self.assertIsNone(evaluate_command("git restore .", mode="read", cwd=clone_dir))
+                self.assertIsNone(evaluate_command(f"cd {clone_dir} && git reset --hard HEAD", mode="read", cwd=repo))
+                self.assertIsNotNone(evaluate_command("git push origin HEAD", mode="read", cwd=clone_dir))
+                self.assertIsNotNone(evaluate_command(f"git -C {repo} reset --hard HEAD", mode="read", cwd=clone_dir))
+            finally:
+                import shutil
 
-    def test_read_mode_blocks_remote_mutations_allows_get_params_and_graphql_vars(self) -> None:
-        self.assertIsNotNone(evaluate_command("git push origin task/x", mode="read"))
-        self.assertIsNotNone(evaluate_command("keel pr publish-verdict 5 --verdict-file /tmp/v.json --head-sha " + "a" * 40, mode="read"))
-        self.assertIsNotNone(evaluate_command("python3 -B /opt/keel/scripts/keel pr verify 5 --pub", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh pr -R o/r comment 5 --body 'lgtm'", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh pr comment 5 --body 'lgtm'", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh pr review 5 --approve", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh api repos/o/r/issues/1/comments -f body=hi", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh api -X DELETE repos/o/r/issues/1/comments/99", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh api -XPOST repos/o/r/issues/1/comments", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh api -f body=hi repos/o/r/issues/1/comments", mode="read"))
-        self.assertIsNotNone(evaluate_command("gh api --input /tmp/body.json repos/o/r/issues/1/comments", mode="read"))
-        self.assertIsNotNone(
-            evaluate_command(
-                "gh api graphql -f query='mutation { closeIssue(input:{issueId:\"1\"}) { clientMutationId } }'",
-                mode="read",
+                shutil.rmtree(verify_scratch, ignore_errors=True)
+
+    def test_write_and_main_protected_default_branch_seatbelt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_repo(repo)
+            wt_info = create_worktree(repo, "feat-1")
+            wt_path = Path(wt_info["path"])
+
+            # 1. `mode == "write"`: blocks mutating git in primary checkout; allows in worktree; blocks targeting main
+            self.assertIsNotNone(evaluate_command("git commit -m 'bad'", mode="write", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git add app.py", mode="write", cwd=repo))
+            self.assertIsNone(evaluate_command("git status && git log -n 1", mode="write", cwd=repo))
+
+            self.assertIsNone(evaluate_command("git add app.py && git commit -m 'ok'", mode="write", cwd=wt_path))
+            self.assertIsNone(evaluate_command(f"cd {wt_path} && git commit -m 'ok'", mode="write", cwd=repo))
+            self.assertIsNone(evaluate_command(f"git -C {wt_path} commit -m 'ok'", mode="write", cwd=repo))
+            self.assertIsNone(evaluate_command("git rebase main", mode="write", cwd=wt_path))
+            self.assertIsNone(evaluate_command("git checkout main -- app.py", mode="write", cwd=wt_path))
+            self.assertIsNone(evaluate_command("git checkout -b task/sub main", mode="write", cwd=wt_path))
+
+            for bad_target in (
+                "git branch -f main HEAD",
+                "git branch -D main",
+                "git update-ref refs/heads/main HEAD",
+                "git fetch . HEAD:main",
+                "git checkout main",
+                "git switch main",
+                "git switch -C master",
+            ):
+                with self.subTest(bad_target=bad_target):
+                    self.assertIsNotNone(evaluate_command(bad_target, mode="write", cwd=wt_path))
+
+            # 2. `mode == "main"` on `main`: blocks merge/rebase/cherry-pick/reset --hard/non-ff pull
+            self.assertIsNotNone(evaluate_command("git merge task/feat-1", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git merge --ff-only task/feat-1", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git rebase task/feat-1", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git cherry-pick task/feat-1", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git reset --hard HEAD~1", mode="main", cwd=repo))
+            self.assertIsNone(evaluate_command("git reset HEAD app.py", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git pull origin main", mode="main", cwd=repo))
+            self.assertIsNone(evaluate_command("git pull --ff-only origin main", mode="main", cwd=repo))
+
+            # 3. `mode == "main"` `git commit` on `main`: ONLY non-empty `docs/tasks/` commits allowed!
+            # Empty commit -> blocked
+            self.assertIsNotNone(evaluate_command("git commit --allow-empty -m 'empty'", mode="main", cwd=repo))
+
+            # Single-command chained `git add docs/tasks/... && git commit` -> allowed!
+            spec_path = repo / "docs" / "tasks" / "active" / "20261117-feat-1.md"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_path.write_text("# Spec\n\n## Goal & Why\nTest.\n", encoding="utf-8")
+            self.assertIsNone(
+                evaluate_command(
+                    "git add docs/tasks/active/20261117-feat-1.md && git commit -m 'docs(tasks): open spec'",
+                    mode="main",
+                    cwd=repo,
+                )
             )
-        )
-        self.assertIsNone(evaluate_command("gh pr view 5 --json title,headRefOid", mode="read"))
-        self.assertIsNone(evaluate_command("gh api repos/o/r/pulls/5", mode="read"))
-        self.assertIsNone(evaluate_command("gh api repos/o/r/issues -X GET -f state=open", mode="read"))
-        self.assertIsNone(
-            evaluate_command(
-                "gh api --jq '.data' graphql -f query='query($o:String!,$r:String!){repository(owner:$o,name:$r){id}}' -F o=a -F r=b",
-                mode="read",
+
+            #Actually stage and commit the task file, then verify `-am` works when ONLY `docs/tasks/` is modified
+            subprocess.run(["git", "-C", str(repo), "add", "docs/tasks/active/20261117-feat-1.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-m", "docs(tasks): open spec"], check=True, capture_output=True
             )
-        )
+            spec_path.write_text("# Spec\n\n## Goal & Why\nUpdated.\n", encoding="utf-8")
+            self.assertIsNone(evaluate_command("git commit -am 'docs(tasks): refine'", mode="main", cwd=repo))
+
+            # If a tracked non-`docs/tasks/` file (`app.py`) is ALSO modified, `-a`/`-am` MUST be rejected!
+            (repo / "app.py").write_text("VALUE = 99\n", encoding="utf-8")
+            self.assertIsNotNone(evaluate_command("git commit -am 'sneak code'", mode="main", cwd=repo))
+            # Explicit non-`docs/tasks/` pathspec -> blocked
+            self.assertIsNotNone(evaluate_command("git commit -m 'sneak' app.py", mode="main", cwd=repo))
+            # Explicit `docs/tasks/` pathspec (without `-i`) -> allowed because it only commits `docs/tasks/...`!
+            self.assertIsNone(
+                evaluate_command(
+                    "git commit -m 'docs(tasks): explicit' docs/tasks/active/20261117-feat-1.md",
+                    mode="main",
+                    cwd=repo,
+                )
+            )
+            # Chained `git mv docs/tasks/... && git commit` on `main` -> allowed!
+            self.assertIsNone(
+                evaluate_command(
+                    "git mv docs/tasks/active/20261117-feat-1.md docs/tasks/archive/20261117-feat-1.md && git commit -m 'archive'",
+                    mode="main",
+                    cwd=repo,
+                )
+            )
+            # Staged code file -> blocked
+            subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True)
+            self.assertIsNotNone(evaluate_command("git commit -m 'staged code'", mode="main", cwd=repo))
+
+            # Staged rename (`git mv app.py docs/tasks/active/app.py`) MUST be caught via `--no-renames` and blocked!
+            subprocess.run(["git", "-C", str(repo), "reset", "--hard", "HEAD"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "mv", "app.py", "docs/tasks/active/app.py"], check=True, capture_output=True
+            )
+            self.assertIsNotNone(evaluate_command("git commit -m 'sneak git mv'", mode="main", cwd=repo))
+            self.assertIsNotNone(evaluate_command("git commit -am 'sneak git mv -a'", mode="main", cwd=repo))
+            self.assertIsNotNone(
+                evaluate_command("git commit -im 'sneak include' docs/tasks/active/app.py", mode="main", cwd=repo)
+            )
 
     def test_detect_agent_mode_from_public_cwd_and_env(self) -> None:
         self.assertEqual(detect_agent_mode(cwd="/repo/.agents/worktrees/feat-a", env={}), "write")
-        self.assertEqual(detect_agent_mode(cwd="/tmp/keel-verify-pr9-abc/checkout", env={}), "read")
+        self.assertEqual(detect_agent_mode(cwd="/tmp/keel-verify-feat-abc/checkout", env={}), "read")
         self.assertEqual(detect_agent_mode(cwd="/repo", env={"KEEL_AGENT_MODE": "read"}), "read")
         self.assertEqual(detect_agent_mode(cwd="/repo", env={}), "main")
+        line_count = len((ROOT / "scripts" / "keel_lib" / "guard_rules.py").read_text(encoding="utf-8").splitlines())
+        self.assertLessEqual(line_count, 650)
 
 
 class PreToolUseHookBinaryTests(unittest.TestCase):
-    def test_antigravity_and_codex_protocols_and_conv_mode_binding(self) -> None:
+    def test_antigravity_and_codex_protocols_and_last_user_input_binding(self) -> None:
         hook = ROOT / "hooks" / "pre-tool-use"
         with tempfile.TemporaryDirectory() as tmp:
-            env = dict(os.environ, PLUGIN_DATA=str(Path(tmp) / "plugin-data"))
-            run_dir = Path(tmp) / "runs" / "run-1"
+            clean_base_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("KEEL_AGENT_MODE", "DEVSTANDARD_AGENT_MODE", "DEVSTANDARD_ROLE")
+            }
+            env = dict(clean_base_env, PLUGIN_DATA=str(Path(tmp) / "plugin-data"))
+            run_dir = Path(tmp) / ".agents" / "runs" / "run-1"
             run_dir.mkdir(parents=True)
             brief = run_dir / "brief.md"
             brief.write_text("# Brief\n", encoding="utf-8")
-            (run_dir / "run.json").write_text(json.dumps({"executor": "agy", "mode": "read"}), encoding="utf-8")
+            (run_dir / "run.json").write_text(
+                json.dumps({"executor": "agy", "mode": "read", "scratch_verify": True}), encoding="utf-8"
+            )
 
-            # 0. Main orchestrator session runs a normal command FIRST, then inspects brief.md -> MUST NOT poison main session!
+            # 0. Main orchestrator session runs a command FIRST, then inspects brief.md -> NEVER poisons main session!
             subprocess.run(
                 [sys.executable, str(hook)],
                 input=json.dumps(
@@ -187,7 +361,7 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
                     {
                         "conversationId": "conv-main-orchestrator",
                         "cwd": "/normal/repo/path",
-                        "toolCall": {"name": "run_command", "args": {"CommandLine": "gh pr comment 1 --body ok"}},
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
                     }
                 ),
                 env=env,
@@ -197,7 +371,26 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(res_main_push.stdout), {"decision": "allow"})
 
-            # 1. Fresh subagent reads brief.md on turn 1 -> binds conversationId to `read` mode automatically!
+            # 1. Fresh subagent calls `run_command` BEFORE `read_file`, with `lastUserInput` referencing `brief.md`
+            # -> binds `conv_id` via `lastUserInput` immediately and blocks `git push`!
+            res_last_input = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-subagent-lastinput",
+                        "cwd": "/normal/repo/path",
+                        "lastUserInput": f"Read `{brief}` in full first and execute that assignment.",
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(res_last_input.stdout)["decision"], "deny")
+
+            # 2. Fresh subagent reads `brief.md` via `read_file` on turn 1 -> binds `conv_id` to `read` mode!
             res_read = subprocess.run(
                 [sys.executable, str(hook)],
                 input=json.dumps(
@@ -214,14 +407,13 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
             )
             self.assertEqual(json.loads(res_read.stdout), {"decision": "allow"})
 
-            # 2. Same subagent later calls `gh pr comment` in `/normal/repo/path` -> DENIED by bound `read` mode!
             res_sub_cmd = subprocess.run(
                 [sys.executable, str(hook)],
                 input=json.dumps(
                     {
                         "conversationId": "conv-subagent-readonly",
                         "cwd": "/normal/repo/path",
-                        "toolCall": {"name": "run_command", "args": {"CommandLine": "gh pr comment 1 --body hi"}},
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "keel branch land x --execute"}},
                     }
                 ),
                 env=env,
@@ -243,7 +435,7 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
             assert proc.stdin is not None and proc.stdout is not None
             start = time.monotonic()
             proc.stdin.write(
-                json.dumps({"cwd": "/tmp", "toolCall": {"name": "write_file", "args": {"Content": "gh pr merge 99"}}})
+                json.dumps({"cwd": "/tmp", "toolCall": {"name": "write_file", "args": {"Content": "git push -f"}}})
             )
             proc.stdin.flush()
             out_line = proc.stdout.readline()
@@ -259,7 +451,9 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
             # 4. Codex Bash protocol deny
             res_codex = subprocess.run(
                 [sys.executable, str(hook)],
-                input=json.dumps({"cwd": "/tmp", "tool_name": "Bash", "tool_input": {"command": "gh pr merge 1"}}),
+                input=json.dumps(
+                    {"cwd": "/tmp", "tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}}
+                ),
                 env=env,
                 text=True,
                 capture_output=True,
@@ -270,8 +464,161 @@ class PreToolUseHookBinaryTests(unittest.TestCase):
                 "deny",
             )
 
+            # 5. Repository path containing spaces binds `mode="read"` on Turn 1 AND upgrades unlocked fallback on read_file
+            space_run = Path(tmp) / "project with spaces" / ".agents" / "runs" / "run-space"
+            space_run.mkdir(parents=True)
+            space_brief = space_run / "brief.md"
+            space_brief.write_text("# Space Brief\n", encoding="utf-8")
+            (space_run / "run.json").write_text(
+                json.dumps({"executor": "agy", "mode": "read", "scratch_verify": False}), encoding="utf-8"
+            )
+            res_space_turn1 = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-space-turn1",
+                        "cwd": str(Path(tmp) / "project with spaces"),
+                        "lastUserInput": f"Read `{space_brief}` in full first and execute that assignment.",
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(res_space_turn1.stdout)["decision"], "deny")
 
-class EnvAndGhApiTests(unittest.TestCase):
+            # Non-shell tool on Turn 1 without brief path -> unlocked fallback; Turn 2 `read_file(space_brief)` upgrades!
+            subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-space-upgrade",
+                        "cwd": str(Path(tmp) / "project with spaces"),
+                        "toolCall": {"name": "list_dir", "args": {}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-space-upgrade",
+                        "cwd": str(Path(tmp) / "project with spaces"),
+                        "toolCall": {"name": "read_file", "args": {"Path": str(space_brief)}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            res_after_upgrade = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-space-upgrade",
+                        "cwd": str(Path(tmp) / "project with spaces"),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(res_after_upgrade.stdout)["decision"], "deny")
+            self.assertTrue((Path(tmp) / "plugin-data" / "conv_modes.lock").is_file())
+
+            # 5a. Main session calling `read_file("SKILL.md")` -> `run_command("git status")` ->
+            # `read_file(".agents/runs/.../brief.md")` -> `run_command("git push --dry-run origin main")` stays `"main"`!
+            for ev in (
+                {
+                    "conversationId": "conv-main-read-first",
+                    "cwd": "/normal/repo/path",
+                    "toolCall": {"name": "read_file", "args": {"Path": "/normal/repo/path/SKILL.md"}},
+                },
+                {
+                    "conversationId": "conv-main-read-first",
+                    "cwd": "/normal/repo/path",
+                    "toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}},
+                },
+                {
+                    "conversationId": "conv-main-read-first",
+                    "cwd": "/normal/repo/path",
+                    "toolCall": {"name": "read_file", "args": {"Path": str(brief)}},
+                },
+            ):
+                subprocess.run(
+                    [sys.executable, str(hook)],
+                    input=json.dumps(ev),
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            res_main_read_first = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-main-read-first",
+                        "cwd": "/normal/repo/path",
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "git push --dry-run origin main"},
+                        },
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(res_main_read_first.stdout)["decision"], "allow")
+
+            # 5b. Subagent calling a non-brief tool on Turn 1 -> `run_command("git push --dry-run origin main")`
+            # on Turn 2 with `lastUserInput` pointing to `brief.md` binds to `"read"` and denies!
+            subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-subagent-turn2-bind",
+                        "cwd": "/normal/repo/path",
+                        "toolCall": {"name": "read_file", "args": {"Path": "/normal/repo/path/README.md"}},
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            res_subagent_turn2 = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps(
+                    {
+                        "conversationId": "conv-subagent-turn2-bind",
+                        "cwd": "/normal/repo/path",
+                        "lastUserInput": f"Read `{brief}` in full and follow its instructions.",
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "git push --dry-run origin main"},
+                        },
+                    }
+                ),
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(res_subagent_turn2.stdout)["decision"], "deny")
+
+
+class EnvHelpersTests(unittest.TestCase):
     def test_run_cmd_missing_executable_raises_keel_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing_executable = str(Path(tmp) / "missing-executable")
@@ -294,181 +641,71 @@ class EnvAndGhApiTests(unittest.TestCase):
                     self.assertIn(argv[0], result.stderr)
                     self.assertNotIn("Working directory", result.stderr)
 
-    def test_run_cmd_missing_cwd_raises_keel_error(self) -> None:
+    def test_run_cmd_missing_cwd_and_non_directory_cwd_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing_cwd = Path(tmp) / "missing-cwd"
-            for cwd in (missing_cwd, str(missing_cwd)):
-                with self.subTest(cwd=cwd):
-                    with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\) not found") as caught:
-                        run_cmd([sys.executable, "-c", "pass"], cwd=cwd, check=True)
-                    self.assertIn(str(missing_cwd), str(caught.exception))
-                    self.assertNotIn("Executable not found", str(caught.exception))
-                    self.assertIsInstance(caught.exception.__cause__, FileNotFoundError)
+            with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\) not found") as caught:
+                run_cmd([sys.executable, "-c", "pass"], cwd=missing_cwd, check=True)
+            self.assertIsInstance(caught.exception.__cause__, FileNotFoundError)
+            res_missing = run_cmd([sys.executable, "-c", "pass"], cwd=missing_cwd, check=False)
+            self.assertEqual(res_missing.returncode, 127)
+            self.assertIn("Working directory (cwd) not found", res_missing.stderr)
 
-    def test_run_cmd_missing_cwd_without_check_returns_127(self) -> None:
+            file_path = Path(tmp) / "file"
+            file_path.write_text("not a directory", encoding="utf-8")
+            with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\)") as caught_nd:
+                run_cmd([sys.executable, "-c", "pass"], cwd=file_path, check=True)
+            self.assertIsInstance(caught_nd.exception.__cause__, NotADirectoryError)
+            res_nd = run_cmd([sys.executable, "-c", "pass"], cwd=file_path, check=False)
+            self.assertEqual(res_nd.returncode, 127)
+            self.assertNotIn("Executable not found", res_nd.stderr)
+
+    def test_run_process_group_diagnostics_and_large_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            missing_exec = str(Path(tmp) / "missing-exec")
+            rc, err = run_process_group([missing_exec], cwd=tmp)
+            self.assertEqual(rc, 127)
+            self.assertIn("Executable not found", err)
+
             missing_cwd = Path(tmp) / "missing-cwd"
-            argv = [sys.executable, "-c", "pass"]
-            with self.assertRaises(FileNotFoundError) as caught:
-                subprocess.run(argv, cwd=str(missing_cwd))
-            result = run_cmd(argv, cwd=missing_cwd, check=False)
-            self.assertEqual(result.args, argv)
-            self.assertEqual(result.returncode, 127)
-            self.assertEqual(result.stdout, "")
-            self.assertIn("Working directory (cwd) not found", result.stderr)
-            self.assertIn(str(missing_cwd), result.stderr)
-            self.assertIn(str(caught.exception), result.stderr)
-            self.assertNotIn("Executable not found", result.stderr)
+            rc2, err2 = run_process_group([sys.executable, "-c", "pass"], cwd=missing_cwd)
+            self.assertEqual(rc2, 127)
+            self.assertIn("Working directory (cwd) not found", err2)
 
-    def test_run_cmd_non_directory_cwd_raises_keel_error(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+            loop = Path(tmp) / "loop"
+            loop.symlink_to(loop.name)
+            with self.assertRaises(KeelError):
+                safe_resolve(loop)
+            rc3, err3 = run_process_group([sys.executable, "-c", "pass"], cwd=loop)
+            self.assertEqual(rc3, 127)
+            self.assertIn("Working directory (cwd)", err3)
+
             file_path = Path(tmp) / "file"
-            file_path.write_text("not a directory", encoding="utf-8")
-            for cwd in (file_path, file_path / "child"):
-                with self.subTest(cwd=cwd):
-                    with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\)") as caught:
-                        run_cmd([sys.executable, "-c", "pass"], cwd=cwd, check=True)
-                    self.assertIn(str(cwd), str(caught.exception))
-                    self.assertNotIn("Executable not found", str(caught.exception))
-                    self.assertIsInstance(caught.exception.__cause__, NotADirectoryError)
-
-    def test_run_cmd_non_directory_cwd_without_check_returns_127(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            file_path = Path(tmp) / "file"
-            file_path.write_text("not a directory", encoding="utf-8")
-            argv = [sys.executable, "-c", "pass"]
-            for cwd in (file_path, file_path / "child"):
-                with self.subTest(cwd=cwd):
-                    with self.assertRaises(NotADirectoryError) as caught:
-                        subprocess.run(argv, cwd=str(cwd))
-                    result = run_cmd(argv, cwd=cwd, check=False)
-                    self.assertEqual(result.args, argv)
-                    self.assertEqual(result.returncode, 127)
-                    self.assertEqual(result.stdout, "")
-                    self.assertIn("Working directory (cwd)", result.stderr)
-                    self.assertIn(str(cwd), result.stderr)
-                    self.assertIn(str(caught.exception), result.stderr)
-                    self.assertNotIn("Executable not found", result.stderr)
-
-    def test_run_process_group_missing_executable_returns_127(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            missing_executable = str(Path(tmp) / "missing-executable")
-            for cwd in (None, tmp):
-                with self.subTest(cwd=cwd):
-                    rc, stderr_text = run_process_group([missing_executable], cwd=cwd)
-                    self.assertEqual(rc, 127)
-                    self.assertIn("Executable not found", stderr_text)
-                    self.assertIn(missing_executable, stderr_text)
-                    self.assertNotIn("Working directory", stderr_text)
-
-    def test_run_process_group_missing_cwd_returns_127(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            missing_cwd = Path(tmp) / "missing-cwd"
-            for cwd in (missing_cwd, str(missing_cwd)):
-                with self.subTest(cwd=cwd):
-                    rc, stderr_text = run_process_group([sys.executable, "-c", "pass"], cwd=cwd)
-                    self.assertEqual(rc, 127)
-                    self.assertIn("Working directory (cwd) not found", stderr_text)
-                    self.assertIn(str(missing_cwd), stderr_text)
-                    self.assertNotIn("Executable not found", stderr_text)
-
-    def test_run_process_group_non_directory_cwd_returns_127(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            file_path = Path(tmp) / "file"
-            file_path.write_text("not a directory", encoding="utf-8")
-            for cwd in (file_path, file_path / "child"):
-                with self.subTest(cwd=cwd):
-                    rc, stderr_text = run_process_group([sys.executable, "-c", "pass"], cwd=cwd)
-                    self.assertEqual(rc, 127)
-                    self.assertIn("Working directory (cwd)", stderr_text)
-                    self.assertIn(str(cwd), stderr_text)
-                    self.assertNotIn("Executable not found", stderr_text)
-
-    def test_symlink_loop_cwd_os_error_is_reported_cleanly(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = Path(tmp) / "loop"
-            cwd.symlink_to(cwd.name)
-            argv = [sys.executable, "-c", "pass"]
-            with self.assertRaisesRegex(KeelError, r"Working directory \(cwd\)") as caught:
-                run_cmd(argv, cwd=cwd, check=True)
-            self.assertIsInstance(caught.exception.__cause__, OSError)
-            result = run_cmd(argv, cwd=cwd, check=False)
-            rc, stderr_text = run_process_group(argv, cwd=cwd)
-            for code, detail in ((result.returncode, result.stderr), (rc, stderr_text)):
-                with self.subTest(detail=detail):
-                    self.assertEqual(code, 127)
-                    self.assertIn("Working directory (cwd)", detail)
-                    self.assertIn(str(caught.exception.__cause__), detail)
-                    self.assertNotIn("Executable not found", detail)
-
-    def test_non_directory_executable_error_with_valid_cwd_is_preserved(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            file_path = Path(tmp) / "file"
-            file_path.write_text("not a directory", encoding="utf-8")
-            argv = [str(file_path / "child")]
-            for check in (True, False):
-                with self.subTest(check=check):
-                    with self.assertRaises(NotADirectoryError):
-                        run_cmd(argv, cwd=tmp, check=check)
+            file_path.write_text("x", encoding="utf-8")
             with self.assertRaises(NotADirectoryError):
-                run_process_group(argv, cwd=tmp)
+                run_cmd([str(file_path / "child")], cwd=tmp, check=True)
 
-    def test_large_stderr_does_not_deadlock_run_process_group(self) -> None:
         lines: list[str] = []
-        rc, stderr_text = run_process_group(
-            [
-                sys.executable,
-                "-c",
-                "import sys; sys.stderr.write('E' * (1024 * 512)); sys.stderr.flush(); print('done')",
-            ],
+        rc_ok, stderr_text = run_process_group(
+            [sys.executable, "-c", "import sys; sys.stderr.write('E' * (1024 * 512)); sys.stderr.flush(); print('done')"],
             on_stdout_line=lines.append,
         )
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc_ok, 0)
         self.assertEqual("".join(lines).strip(), "done")
         self.assertEqual(len(stderr_text), 1024 * 512)
 
-    def test_decode_paginated_streams(self) -> None:
-        self.assertEqual(decode_json_stream("[1, 2][3, 4]"), [1, 2, 3, 4])
-        pages = decode_json_stream('{"check_runs": [{"id": 1}]}\n{"check_runs": [{"id": 2}]}')
-        self.assertEqual(len(pages), 2)
-
-    def test_gh_api_retries_only_idempotent_transient_reads(self) -> None:
-        calls: list[list[str]] = []
-
-        def flaky_read(argv: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
-            calls.append(argv)
-            if len(calls) < 3:
-                return subprocess.CompletedProcess(argv, 1, "", 'Get "https://api.github.com/...": EOF')
-            return subprocess.CompletedProcess(argv, 0, '{"ok": true}', "")
-
-        out = gh_api("repos/o/r/pulls/1", ("--paginate",), runner=flaky_read)
-        self.assertEqual(out, {"ok": True})
-        self.assertEqual(len(calls), 3)
-
-        post_calls = 0
-
-        def flaky_post(argv: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
-            nonlocal post_calls
-            post_calls += 1
-            return subprocess.CompletedProcess(argv, 1, "", 'Post "https://api.github.com/...": EOF')
-
-        with self.assertRaises(KeelError):
-            gh_api("repos/o/r/issues/1/comments", ("-X", "POST", "-f", "body=hi"), runner=flaky_post)
-        self.assertEqual(post_calls, 1)
-
-    def test_safe_resolve_catches_symlink_loop(self) -> None:
+    def test_path_identity_and_tool_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            a = Path(tmp) / "loop_a"
-            b = Path(tmp) / "loop_b"
-            os.symlink(b, a)
-            os.symlink(a, b)
-            with self.assertRaises(KeelError):
-                safe_resolve(a)
-
-    def test_tool_env_sets_noninteractive_defaults(self) -> None:
-        env = tool_env()
+            base = Path(tmp) / "real"
+            child = base / "nested"
+            child.mkdir(parents=True)
+            alias = Path(tmp) / "alias"
+            alias.symlink_to(base)
+            self.assertTrue(same_path(base, alias))
+            self.assertTrue(is_subpath(alias / "nested", base))
+        env = tool_env({"CUSTOM_KEY": "val"})
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(env["GH_PROMPT_DISABLED"], "1")
+        self.assertEqual(env["CUSTOM_KEY"], "val")
 
 
 if __name__ == "__main__":

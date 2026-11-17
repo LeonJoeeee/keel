@@ -124,10 +124,10 @@ rm -rf /tmp/keel-plugin-test
 ## Progress
 
 - [x] Align all 5 architecture stages (`AGENTS.md`, `docs/tasks/`, context registration, slim `PreToolUse` seatbelt, `keel branch` local gate) and open baseline task spec on `main`.
-- [ ] Implement Milestone 1: Core `env.py`, `worktree.py`, `context.py` + `executors/` fixes & `gpt-6-astra @ max` defaults.
-- [ ] Implement Milestone 2: Slim pure-Git `guard_rules.py` & `hooks/pre-tool-use`.
-- [ ] Implement Milestone 3: `branch_gate.py`, `scripts/keel` (`keel branch`), updated `rules/`, `skills/`, `config/presets/`, `AGENTS.md`, `README.md`, `docs/`, and full unit/integration test suite.
-- [ ] Run `--dual` independent clean-context verification (`agy` + `codex` `gpt-6-astra @ max`) and prepare human landing summary.
+- [x] Implement Milestone 1: Core `env.py`, `worktree.py`, `context.py` + `executors/` fixes & `gpt-6-astra @ max` defaults.
+- [x] Implement Milestone 2: Slim pure-Git `guard_rules.py` & `hooks/pre-tool-use`.
+- [x] Implement Milestone 3: `branch_gate.py`, `scripts/keel` (`keel branch`), updated `rules/`, `skills/`, `config/presets/`, `AGENTS.md`, `README.md`, `docs/`, and full unit/integration test suite.
+- [x] Run `--dual` independent clean-context verification (`agy` + `codex` `gpt-6-astra @ max`) and prepare human landing summary.
 
 ## Decisions & Findings
 

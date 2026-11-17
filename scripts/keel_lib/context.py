@@ -8,7 +8,8 @@ from pathlib import Path
 import secrets
 from typing import Any
 
-from . import KeelError, PRESETS_DIR
+from . import KeelError, PLUGIN_ROOT, PRESETS_DIR
+from .env import is_subpath
 from .worktree import ROOT_AGENT_DOCS
 
 
@@ -25,14 +26,57 @@ def load_preset_text(preset: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def find_repo_agent_doc(project_root: Path | None) -> tuple[str, str] | None:
-    if project_root is None:
-        return None
-    for name in ROOT_AGENT_DOCS:
-        candidate = project_root / name
-        if candidate.is_file():
-            return name, candidate.read_text(encoding="utf-8").strip()
+def load_universal_spine() -> str:
+    """Extract universal sections 1–3 of `rules/AGENTS.md` for non-plugin executors (e.g., Codex CLI)."""
+    spine_path = PLUGIN_ROOT / "rules" / "AGENTS.md"
+    if not spine_path.is_file():
+        return ""
+    raw = spine_path.read_text(encoding="utf-8")
+    start_idx = raw.find("## 1.")
+    if start_idx == -1:
+        return raw.strip()
+    end_idx = raw.find("\n## 4.", start_idx)
+    sliced = raw[start_idx:end_idx] if end_idx != -1 else raw[start_idx:]
+    return sliced.strip()
+
+
+def find_repo_agent_doc(project_root: Path | None, workdir: Path | None = None) -> tuple[str, str] | None:
+    """Prefer reading agent doc (`AGENTS.md` / `GEMINI.md`) from `workdir` if present, else `project_root`."""
+    for base in (workdir, project_root):
+        if base is None:
+            continue
+        for name in ROOT_AGENT_DOCS:
+            candidate = base / name
+            if candidate.is_file():
+                return name, candidate.read_text(encoding="utf-8").strip()
     return None
+
+
+def _is_agent_doc_natively_loaded(
+    doc_name: str,
+    *,
+    workdir: Path,
+    project_root: Path | None,
+    caller_cwd: Path | None,
+    native_agent_docs: tuple[str, ...],
+    loads_plugin_spine: bool,
+) -> bool:
+    if doc_name not in native_agent_docs:
+        return False
+    if not loads_plugin_spine:
+        # Standalone CLI executor (e.g. `codex -C <workdir>`) reads `<workdir>/<doc_name>` directly.
+        return (workdir / doc_name).is_file()
+    # Host-inherited executor (`agy`): `<user_rules>` only loads the parent session's active workspace (`caller_cwd`).
+    eff_caller = caller_cwd if caller_cwd is not None else Path.cwd()
+    if project_root is None:
+        return False
+    if not (is_subpath(eff_caller, project_root) and is_subpath(workdir, project_root)):
+        return False
+    proj_doc = project_root / doc_name
+    work_doc = workdir / doc_name
+    if not (proj_doc.is_file() and work_doc.is_file()):
+        return False
+    return work_doc.read_bytes() == proj_doc.read_bytes()
 
 
 def assemble_brief(
@@ -44,6 +88,8 @@ def assemble_brief(
     workdir: Path,
     project_root: Path | None,
     native_agent_docs: tuple[str, ...] = (),
+    loads_plugin_spine: bool = False,
+    caller_cwd: Path | None = None,
     schema_path: Path | None = None,
     output_path: Path | None = None,
     inject_schema_in_brief: bool = False,
@@ -55,12 +101,25 @@ def assemble_brief(
 
     sections: list[str] = ["# Subagent Assignment"]
 
-    # Inject repo agent doc iff the executor does NOT natively load a doc already present in `workdir`
-    natively_loaded = any((workdir / name).is_file() for name in native_agent_docs)
-    if not natively_loaded:
-        found = find_repo_agent_doc(project_root)
-        if found is not None:
-            doc_name, doc_body = found
+    # Leak ② fix: include universal sections 1–3 of `rules/AGENTS.md` when executor does not load plugin spine
+    if not loads_plugin_spine:
+        spine = load_universal_spine()
+        if spine:
+            sections.append(f"## Engineering Spine\n\n{spine}")
+
+    # Leak ① fix: inject repo agent doc whenever not genuinely natively loaded with identical bytes
+    found = find_repo_agent_doc(project_root, workdir=workdir)
+    if found is not None:
+        doc_name, doc_body = found
+        natively_loaded = _is_agent_doc_natively_loaded(
+            doc_name,
+            workdir=workdir,
+            project_root=project_root,
+            caller_cwd=caller_cwd,
+            native_agent_docs=native_agent_docs,
+            loads_plugin_spine=loads_plugin_spine,
+        )
+        if not natively_loaded:
             sections.append(f"## Project Context (`{doc_name}`)\n\n{doc_body}")
 
     sections.append(
@@ -85,6 +144,13 @@ def assemble_brief(
                 "## Output Contract\n\n"
                 "Return valid JSON conforming strictly to the attached output schema."
             )
+    elif not inject_schema_in_brief:
+        # Leak ③ fix: clarify `-o` auto-capture for non-schema CLI runs (e.g. `codex exec -o`)
+        sections.append(
+            "## Output Contract\n\n"
+            "Emit your concise final report directly as your final assistant message "
+            "(it is captured automatically via `-o`); do not create extra report files unless explicitly requested."
+        )
 
     return "\n\n".join(sections) + "\n"
 

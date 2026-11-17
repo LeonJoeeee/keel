@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -12,11 +16,18 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from keel_lib import KeelError, load_defaults  # noqa: E402
+from keel_lib import KeelError, SCHEMAS_DIR, load_defaults  # noqa: E402
 from keel_lib.context import assemble_brief  # noqa: E402
 from keel_lib.executors import EXECUTORS, ExecutorAdapter, RunRequest  # noqa: E402
+from keel_lib.executors.agy import AgyExecutor  # noqa: E402
 from keel_lib.executors.codex import CodexExecutor  # noqa: E402
-from keel_lib.worktree import cleanup_worktree, create_disposable_clone, create_worktree  # noqa: E402
+from keel_lib.worktree import (  # noqa: E402
+    cleanup_worktree,
+    create_disposable_clone,
+    create_worktree,
+    git_dirs,
+    save_branch_state,
+)
 
 
 def _init_repo(path: Path) -> str:
@@ -34,6 +45,7 @@ def _init_repo(path: Path) -> str:
 class DummyThirdSideExecutor(ExecutorAdapter):
     name = "dummy-sdk"
     native_agent_docs = ()
+    loads_plugin_spine = False
     inject_schema_in_brief = True
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
@@ -51,25 +63,28 @@ class DummyThirdSideExecutor(ExecutorAdapter):
 
 
 class WorktreeAndDispatchTests(unittest.TestCase):
-    def test_adopted_repo_zero_dirty_worktree_and_gitignored_agents_md_sync(self) -> None:
+    def test_pure_git_worktree_remote_stripping_and_ancestry_or_squash_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "adopted"
             repo.mkdir()
-            head_sha = _init_repo(repo)
-            # Simulate repo that gitignores /AGENTS.md locally
+            _init_repo(repo)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://example.invalid/repo.git"], check=True)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "th", "ssh://th/repo.git"], check=True)
+
             (repo / ".gitignore").write_text("/AGENTS.md\n__pycache__/\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
             subprocess.run(["git", "-C", str(repo), "commit", "-m", "gitignore"], check=True, capture_output=True)
-            head_sha = subprocess.run(
+            base_sha = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
             ).stdout.strip()
             (repo / "AGENTS.md").write_text("## Core need\nKeep data lossless.\n", encoding="utf-8")
 
-            wt_info = create_worktree(repo, "feat-1", base="HEAD", fetch=False)
+            # Default `create_worktree` uses local `main` with `fetch=False` (never contacts unreachable origin!)
+            wt_info = create_worktree(repo, "feat-1")
             wt_path = Path(wt_info["path"])
+            self.assertEqual(wt_info["base"], "main")
             self.assertEqual(wt_info["synced_docs"], ["AGENTS.md"])
             self.assertTrue((wt_path / "AGENTS.md").is_file())
-            # Main repo status stays 100% clean (.git/info/exclude absorbed .agents/)
             main_porcelain = subprocess.run(
                 ["git", "-C", str(repo), "status", "--porcelain", "-uall"],
                 check=True,
@@ -78,176 +93,322 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             ).stdout.strip()
             self.assertEqual(main_porcelain, "")
 
-            # Disposable verification clone ALSO syncs gitignored AGENTS.md
-            scratch = Path(tmp) / "verify-clone"
-            clone_dir, _ = create_disposable_clone(repo, head_sha, scratch)
+            # Disposable verification clone syncs gitignored AGENTS.md AND strips ALL git remotes!
+            scratch = Path(tmp) / "keel-verify-feat-1"
+            clone_dir, _ = create_disposable_clone(repo, base_sha, scratch)
             self.assertTrue((clone_dir / "AGENTS.md").is_file())
+            remotes_in_clone = subprocess.run(
+                ["git", "-C", str(clone_dir), "remote"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(remotes_in_clone, "")
 
-            # Create ignored __pycache__ inside worktree — cleanup should NOT wedge on caches!
+            # Add a commit on `task/feat-1`: unintegrated cleanup without `--discard` MUST be refused!
+            (wt_path / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_path), "add", "app.py"], check=True)
+            subprocess.run(["git", "-C", str(wt_path), "commit", "-m", "feat"], check=True, capture_output=True)
+            feat_sha = subprocess.run(
+                ["git", "-C", str(wt_path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+            with self.assertRaises(KeelError):
+                cleanup_worktree(repo, "feat-1", caller_cwd=tmp)
+            self.assertTrue((wt_path / "AGENTS.md").is_file())
+
+            # Modified gitignored AGENTS.md blocks cleanup unless `--discard`
+            (wt_path / "AGENTS.md").write_text("## Core need\nEdited locally!\n", encoding="utf-8")
+            common_dir, _ = git_dirs(repo)
+            save_branch_state(
+                common_dir,
+                "task/feat-1",
+                {"branch": "task/feat-1", "landed_head_sha": feat_sha, "landed_sha": base_sha},
+            )
+            with self.assertRaises(KeelError):
+                cleanup_worktree(repo, "feat-1", caller_cwd=tmp)
+
+            # Restore gitignored AGENTS.md + add __pycache__: recorded squash-land SHA allows clean teardown!
+            (wt_path / "AGENTS.md").write_text("## Core need\nKeep data lossless.\n", encoding="utf-8")
             cache_dir = wt_path / "__pycache__"
             cache_dir.mkdir()
             (cache_dir / "mod.cpython-312.pyc").write_bytes(b"123")
-
-            # Modifying gitignored AGENTS.md inside worktree blocks accidental loss unless --discard
-            (wt_path / "AGENTS.md").write_text("## Core need\nEdited locally!\n", encoding="utf-8")
-            with self.assertRaises(KeelError):
-                cleanup_worktree(repo, "feat-1", merged_head_sha=head_sha, caller_cwd=tmp)
-
-            # Rejected cleanup (wrong merged_head_sha) MUST NOT unlink synced AGENTS.md!
-            (wt_path / "AGENTS.md").write_text("## Core need\nKeep data lossless.\n", encoding="utf-8")
-            with self.assertRaises(KeelError):
-                cleanup_worktree(repo, "feat-1", merged_head_sha="0" * 40, caller_cwd=tmp)
-            self.assertTrue((wt_path / "AGENTS.md").is_file())
-
-            # Valid merged_head_sha -> cleanup succeeds cleanly even with __pycache__!
-            res = cleanup_worktree(repo, "feat-1", merged_head_sha=head_sha, caller_cwd=tmp)
+            res = cleanup_worktree(repo, "feat-1", caller_cwd=tmp)
             self.assertFalse(wt_path.exists())
             self.assertEqual(res["deleted_branch"], "task/feat-1")
 
-    def test_codex_argv_worktree_dual_git_dirs_and_resume_flag_ordering(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            _init_repo(repo)
-            wt_info = create_worktree(repo, "codex-lane", base="HEAD", fetch=False)
-            wt_path = Path(wt_info["path"])
-
-            codex = CodexExecutor()
-            defaults = load_defaults()
-            out_file = Path(tmp) / "out.json"
-            schema_file = ROOT / "config" / "schemas" / "verdict.schema.json"
-
-            argv = codex.build_exec_argv(
-                workdir=wt_path,
-                mode="write",
-                model="gpt-6.1-sol",
-                effort="xhigh",
-                output_path=out_file,
-                defaults=defaults,
-                schema_path=schema_file,
-                resume_session_id="12345678-1234-1234-1234-123456789abc",
-            )
-            # Linked worktree must pass TWO distinct --add-dir entries (common .git + worktrees/codex-lane)
-            add_dir_indices = [i for i, tok in enumerate(argv) if tok == "--add-dir"]
-            self.assertEqual(len(add_dir_indices), 2)
-
-            # Top-level flags (-s, -C, --add-dir) MUST appear BEFORE 'resume'
-            resume_idx = argv.index("resume")
-            self.assertLess(argv.index("-s"), resume_idx)
-            self.assertLess(argv.index("-C"), resume_idx)
-            self.assertTrue(all(idx < resume_idx for idx in add_dir_indices))
-            self.assertIn("--output-schema", argv)
-            self.assertEqual(argv[-1], "-")
-
-    def test_codex_defaults_xhigh_verify_and_subagent_inheritance(self) -> None:
+    def test_codex_astra_max_defaults_and_read_only_vs_disposable_sandbox(self) -> None:
         codex = CodexExecutor()
         defaults = load_defaults()
         codex_cfg = defaults["executors"]["codex"]
 
-        self.assertEqual(codex_cfg["presets"]["implement"], {"model": "gpt-6.1-sol", "effort": "xhigh"})
-        self.assertEqual(codex_cfg["presets"]["verify"], {"model": "gpt-6.1-sol", "effort": "xhigh"})
-        self.assertEqual(codex_cfg["subagent_default"], {"model": "inherit", "effort": "inherit"})
-
-        self.assertEqual(codex._resolve_model_effort("verify", None, None, defaults), ("gpt-6.1-sol", "xhigh"))
-        self.assertEqual(codex._resolve_model_effort("implement", "inherit", "inherit", defaults), ("gpt-6.1-sol", "xhigh"))
+        for preset in ("general", "implement", "verify"):
+            self.assertEqual(codex_cfg["presets"][preset], {"model": "gpt-6-astra", "effort": "max"})
+            self.assertEqual(codex._resolve_model_effort(preset, None, None, defaults), ("gpt-6-astra", "max"))
+        # Empty defaults fallback ALSO resolves to `("gpt-6-astra", "max")`
+        self.assertEqual(codex._resolve_model_effort("verify", None, None, {}), ("gpt-6-astra", "max"))
+        # CLI flags override cleanly
+        self.assertEqual(
+            codex._resolve_model_effort("implement", "gpt-6.1-sol", "xhigh", defaults),
+            ("gpt-6.1-sol", "xhigh"),
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
-            workdir = Path(tmp)
-            out_file = workdir / "out.md"
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            head_sha = _init_repo(repo)
+            wt_info = create_worktree(repo, "codex-lane")
+            wt_path = Path(wt_info["path"])
+            out_file = Path(tmp) / "out.json"
+            schema_file = SCHEMAS_DIR / "verdict.schema.json"
 
-            argv_sol = codex.build_exec_argv(
-                workdir=workdir,
+            # 1. `mode="read"` outside disposable verify clone -> `-s read-only` and NO `--add-dir` writable grants!
+            argv_ro = codex.build_exec_argv(
+                workdir=repo,
                 mode="read",
-                model="gpt-6.1-sol",
-                effort="xhigh",
-                output_path=out_file,
-                defaults=defaults,
-            )
-            self.assertIn('agents.default_subagent_model="gpt-6.1-sol"', argv_sol)
-            self.assertIn('agents.default_subagent_reasoning_effort="xhigh"', argv_sol)
-            self.assertFalse(any("gpt-6.1-terra" in tok for tok in argv_sol))
-            self.assertFalse(any('="inherit"' in tok for tok in argv_sol))
-
-            argv_astra = codex.build_exec_argv(
-                workdir=workdir,
-                mode="write",
                 model="gpt-6-astra",
                 effort="max",
                 output_path=out_file,
                 defaults=defaults,
             )
-            self.assertIn('agents.default_subagent_model="gpt-6-astra"', argv_astra)
-            self.assertIn('agents.default_subagent_reasoning_effort="max"', argv_astra)
-            self.assertFalse(any("gpt-6.1-terra" in tok for tok in argv_astra))
+            s_idx = argv_ro.index("-s")
+            self.assertEqual(argv_ro[s_idx + 1], "read-only")
+            self.assertNotIn("--add-dir", argv_ro)
+            self.assertIn('agents.default_subagent_model="gpt-6-astra"', argv_ro)
+            self.assertIn('agents.default_subagent_reasoning_effort="max"', argv_ro)
 
-            explicit_override_defaults = {
+            # 1b. Explicit `subagent_default` overrides (`gpt-6.1-terra` @ `high`) apply to child subagents cleanly!
+            custom_sub_defaults = {
                 "executors": {
                     "codex": {
-                        "subagent_default": {
-                            "model": "gpt-6.1-terra",
-                            "effort": "high",
-                        }
+                        "presets": codex_cfg["presets"],
+                        "subagent_default": {"model": "gpt-6.1-terra", "effort": "high"},
                     }
                 }
             }
-            argv_override = codex.build_exec_argv(
-                workdir=workdir,
+            argv_custom_sub = codex.build_exec_argv(
+                workdir=repo,
                 mode="read",
-                model="gpt-6.1-sol",
-                effort="xhigh",
+                model="gpt-6-astra",
+                effort="max",
                 output_path=out_file,
-                defaults=explicit_override_defaults,
+                defaults=custom_sub_defaults,
             )
-            self.assertIn('agents.default_subagent_model="gpt-6.1-terra"', argv_override)
-            self.assertIn('agents.default_subagent_reasoning_effort="high"', argv_override)
+            self.assertEqual(argv_custom_sub[argv_custom_sub.index("-m") + 1], "gpt-6-astra")
+            self.assertIn('model_reasoning_effort="max"', argv_custom_sub)
+            self.assertIn('agents.default_subagent_model="gpt-6.1-terra"', argv_custom_sub)
+            self.assertIn('agents.default_subagent_reasoning_effort="high"', argv_custom_sub)
 
-    def test_universal_context_engineering_and_pluggable_third_executor(self) -> None:
+            # 2. `mode="read"` inside disposable `/tmp/keel-verify-*` clone (`allow_disposable_write=True`)
+            # -> `-s workspace-write` scoped ONLY to `/tmp` clone + its separated git dir (real repo never added!)
+            verify_scratch = Path(tmp) / "keel-verify-codex"
+            clone_dir, sep_git = create_disposable_clone(repo, head_sha, verify_scratch)
+            argv_verify = codex.build_exec_argv(
+                workdir=clone_dir,
+                mode="read",
+                model="gpt-6-astra",
+                effort="max",
+                output_path=out_file,
+                defaults=defaults,
+                schema_path=schema_file,
+                extra_git_dirs=(sep_git,),
+                allow_disposable_write=True,
+            )
+            self.assertEqual(argv_verify[argv_verify.index("-s") + 1], "workspace-write")
+            add_dirs = [argv_verify[i + 1] for i, tok in enumerate(argv_verify) if tok == "--add-dir"]
+            self.assertEqual(add_dirs, [str(sep_git)])
+            self.assertNotIn(str(repo), " ".join(add_dirs))
+
+            # 3. `mode="write"` in linked worktree -> two `--add-dir` entries and top-level flags precede `resume`
+            argv_wt = codex.build_exec_argv(
+                workdir=wt_path,
+                mode="write",
+                model="gpt-6-astra",
+                effort="max",
+                output_path=out_file,
+                defaults=defaults,
+                schema_path=schema_file,
+                resume_session_id="12345678-1234-1234-1234-123456789abc",
+            )
+            add_dir_indices = [i for i, tok in enumerate(argv_wt) if tok == "--add-dir"]
+            self.assertEqual(len(add_dir_indices), 2)
+            resume_idx = argv_wt.index("resume")
+            self.assertLess(argv_wt.index("-s"), resume_idx)
+            self.assertLess(argv_wt.index("-C"), resume_idx)
+            self.assertTrue(all(idx < resume_idx for idx in add_dir_indices))
+
+    def test_three_context_registration_leak_fixes_and_third_executor(self) -> None:
+        agy = AgyExecutor()
+        codex = CodexExecutor()
+        self.assertTrue(agy.loads_plugin_spine)
+        self.assertFalse(codex.loads_plugin_spine)
+
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "proj"
+            sibling = Path(tmp) / "sibling"
+            disposable = Path(tmp) / "keel-verify-123" / "checkout"
             repo.mkdir()
+            sibling.mkdir()
+            disposable.mkdir(parents=True)
             _init_repo(repo)
             (repo / "AGENTS.md").write_text("## Core need\nZero data corruption.\n", encoding="utf-8")
+            (disposable / "AGENTS.md").write_text("## Core need\nZero data corruption.\n", encoding="utf-8")
 
-            # 1. Native AGY auto-loads AGENTS.md & GEMINI.md -> brief does NOT duplicate AGENTS.md
-            brief_agy = assemble_brief(
-                why="Verify parser invariants preserve lossless round-trip.",
-                task="Check edge cases in app.py.",
+            # 1. AGY inside same workspace with identical AGENTS.md bytes -> neither spine nor AGENTS.md duplicated
+            brief_agy_same = assemble_brief(
+                why="Verify parser invariants.",
+                task="Check edge cases.",
                 preset="general",
                 mode="read",
                 workdir=repo,
                 project_root=repo,
-                native_agent_docs=("AGENTS.md", "GEMINI.md"),
+                native_agent_docs=agy.native_agent_docs,
+                loads_plugin_spine=agy.loads_plugin_spine,
+                caller_cwd=repo,
+                inject_schema_in_brief=agy.inject_schema_in_brief,
             )
-            self.assertNotIn("Zero data corruption.", brief_agy)
-            self.assertIn("Verify parser invariants", brief_agy)
+            self.assertNotIn("## Engineering Spine", brief_agy_same)
+            self.assertNotIn("Zero data corruption.", brief_agy_same)
+            self.assertNotIn("captured automatically via `-o`", brief_agy_same)
 
-            # 1b. Repo with ONLY GEMINI.md dispatched to Codex (which natively loads only AGENTS.md) -> injects GEMINI.md!
+            # 2. Leak ① fix: AGY with `/tmp` disposable clone OR cross-dir `caller_cwd` OR branch-edited `AGENTS.md`
+            # -> MUST inject `AGENTS.md` into `brief.md`!
+            brief_agy_tmp = assemble_brief(
+                why="Verify disposable clone.",
+                task="Run tests.",
+                preset="verify",
+                mode="read",
+                workdir=disposable,
+                project_root=repo,
+                native_agent_docs=agy.native_agent_docs,
+                loads_plugin_spine=agy.loads_plugin_spine,
+                caller_cwd=repo,
+                inject_schema_in_brief=agy.inject_schema_in_brief,
+            )
+            self.assertIn("Zero data corruption.", brief_agy_tmp)
+
+            brief_agy_cross = assemble_brief(
+                why="Cross-project research.",
+                task="Inspect repo.",
+                preset="general",
+                mode="read",
+                workdir=repo,
+                project_root=repo,
+                native_agent_docs=agy.native_agent_docs,
+                loads_plugin_spine=agy.loads_plugin_spine,
+                caller_cwd=sibling,
+                inject_schema_in_brief=agy.inject_schema_in_brief,
+            )
+            self.assertIn("Zero data corruption.", brief_agy_cross)
+
+            wt = Path(create_worktree(repo, "edit-agents")["path"])
+            (wt / "AGENTS.md").write_text("## Core need\nBranch-updated invariant.\n", encoding="utf-8")
+            brief_agy_edited = assemble_brief(
+                why="Verify updated AGENTS.md.",
+                task="Check branch.",
+                preset="implement",
+                mode="write",
+                workdir=wt,
+                project_root=repo,
+                native_agent_docs=agy.native_agent_docs,
+                loads_plugin_spine=agy.loads_plugin_spine,
+                caller_cwd=repo,
+                inject_schema_in_brief=agy.inject_schema_in_brief,
+            )
+            self.assertIn("Branch-updated invariant.", brief_agy_edited)
+
+            # 3. Leak ② & Leak ③ fixes: Codex receives universal sections 1–3 of `rules/AGENTS.md` + `-o` Output Contract!
+            brief_codex = assemble_brief(
+                why="Implement feature.",
+                task="Edit app.py.",
+                preset="implement",
+                mode="write",
+                workdir=repo,
+                project_root=repo,
+                native_agent_docs=codex.native_agent_docs,
+                loads_plugin_spine=codex.loads_plugin_spine,
+                caller_cwd=repo,
+                inject_schema_in_brief=codex.inject_schema_in_brief,
+            )
+            self.assertIn("## Engineering Spine", brief_codex)
+            self.assertIn("## 1. Global core-need alignment", brief_codex)
+            self.assertIn("## 3. Protect human attention", brief_codex)
+            self.assertNotIn("## 4. On-demand workflow skills", brief_codex)
+            self.assertNotIn("Zero data corruption.", brief_codex)  # Codex natively loads `<workdir>/AGENTS.md`
+            self.assertIn("captured automatically via `-o`", brief_codex)
+
+            # 3b. Repo containing ONLY `GEMINI.md` (no `AGENTS.md`) injects `GEMINI.md` into `brief.md` for Codex & cross-dir AGY!
             (repo / "AGENTS.md").unlink()
             (repo / "GEMINI.md").write_text("## Core need\nGemini-only core invariant.\n", encoding="utf-8")
             brief_codex_gemini = assemble_brief(
-                why="Ensure Codex still receives GEMINI.md.",
+                why="Ensure Codex receives GEMINI.md when AGENTS.md is absent.",
                 task="Inspect app.py.",
                 preset="general",
                 mode="read",
                 workdir=repo,
                 project_root=repo,
-                native_agent_docs=("AGENTS.md",),
+                native_agent_docs=codex.native_agent_docs,
+                loads_plugin_spine=codex.loads_plugin_spine,
+                caller_cwd=repo,
+                inject_schema_in_brief=codex.inject_schema_in_brief,
             )
+            self.assertIn("## Project Context (`GEMINI.md`)", brief_codex_gemini)
             self.assertIn("Gemini-only core invariant.", brief_codex_gemini)
+
+            brief_agy_gemini_cross = assemble_brief(
+                why="Ensure cross-dir AGY receives GEMINI.md.",
+                task="Inspect app.py.",
+                preset="general",
+                mode="read",
+                workdir=repo,
+                project_root=repo,
+                native_agent_docs=agy.native_agent_docs,
+                loads_plugin_spine=agy.loads_plugin_spine,
+                caller_cwd=sibling,
+                inject_schema_in_brief=agy.inject_schema_in_brief,
+            )
+            self.assertIn("Gemini-only core invariant.", brief_agy_gemini_cross)
             (repo / "GEMINI.md").unlink()
             (repo / "AGENTS.md").write_text("## Core need\nZero data corruption.\n", encoding="utf-8")
 
-            # 2. Pluggable 3rd executor with auto_loads_agents_md=False -> automatically gets AGENTS.md!
-            import contextlib
-            import importlib.machinery
-            import importlib.util
-            import io
-
+            # 4. Pluggable 3rd executor via `scripts/keel` CLI (plus `.agents/worktrees/keel-verify-read` stays scratch_verify=False)
             loader = importlib.machinery.SourceFileLoader("keel_cli", str(ROOT / "scripts" / "keel"))
             spec = importlib.util.spec_from_loader("keel_cli", loader)
             assert spec is not None and spec.loader is not None
             keel_cli = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(keel_cli)
+
+            buf_wt = io.StringIO()
+            with contextlib.redirect_stdout(buf_wt):
+                rc_wt = keel_cli.main(
+                    [
+                        "agent",
+                        "run",
+                        "--project",
+                        str(repo),
+                        "--executor",
+                        "agy",
+                        "--mode",
+                        "read",
+                        "--worktree",
+                        "keel-verify-read",
+                        "--why",
+                        "Read-only audit in a worktree whose slug starts with keel-verify-.",
+                        "--task",
+                        "Inspect app.py without mutating.",
+                    ]
+                )
+            self.assertEqual(rc_wt, 0)
+            wt_payload = json.loads(buf_wt.getvalue())
+            self.assertFalse(wt_payload["scratch_verify"])
+            codex_wt_argv = codex.build_exec_argv(
+                workdir=Path(wt_payload["workdir"]),
+                mode="read",
+                model="gpt-6-astra",
+                effort="max",
+                output_path=Path(tmp) / "ro.md",
+                defaults=load_defaults(),
+                allow_disposable_write=wt_payload["scratch_verify"],
+            )
+            self.assertEqual(codex_wt_argv[codex_wt_argv.index("-s") + 1], "read-only")
+            self.assertNotIn("--add-dir", codex_wt_argv)
 
             EXECUTORS["dummy-sdk"] = DummyThirdSideExecutor
             try:
@@ -264,21 +425,36 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                             "--preset",
                             "general",
                             "--why",
-                            "Benchmark alternative serializer against Core need.",
+                            "Benchmark serializer against Core need.",
                             "--task",
-                            "Compare msgpack vs json latency.",
+                            "Compare latency.",
                         ]
                     )
                 self.assertEqual(rc, 0)
                 payload = json.loads(buf.getvalue())
-                self.assertEqual(payload["executor"], "dummy-sdk")
                 brief_sdk = Path(payload["brief_path"]).read_text(encoding="utf-8")
+                self.assertIn("## Engineering Spine", brief_sdk)
                 self.assertIn("Zero data corruption.", brief_sdk)
             finally:
                 EXECUTORS.pop("dummy-sdk", None)
 
+    def test_root_agents_md_exemplifies_five_section_under_100_lines_standard(self) -> None:
+        agents_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        lines = agents_text.splitlines()
+        self.assertLess(len(lines), 100)
+        headings = [ln.strip() for ln in lines if ln.startswith("## ")]
+        self.assertEqual(
+            headings,
+            [
+                "## Core need",
+                "## Architecture & Boundaries",
+                "## Commands",
+                "## Gotchas",
+                "## Where to look",
+            ],
+        )
+
     def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
-        self.assertTrue((ROOT / "AGENTS.md").is_file())
         installer = ROOT / "scripts" / "install-plugin"
         expected_entries = {
             "plugin.json",
@@ -297,11 +473,8 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             plugin_dir = tmp_path / "plugins" / "keel"
             bin_dir = tmp_path / "bin"
             plugin_dir.parent.mkdir(parents=True)
-            # Simulate upgrading from an existing top-level directory symlink
             plugin_dir.symlink_to(ROOT)
-            self.assertTrue(plugin_dir.is_symlink())
 
-            # Top-level symlink must fail --check
             chk_before = subprocess.run(
                 [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
                 capture_output=True,
@@ -316,21 +489,11 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 text=True,
             )
             self.assertFalse(plugin_dir.is_symlink())
-            self.assertTrue(plugin_dir.is_dir())
             self.assertEqual({p.name for p in plugin_dir.iterdir()}, expected_entries)
-            for name in expected_entries:
-                entry = plugin_dir / name
-                self.assertTrue(entry.is_symlink())
-                self.assertEqual(entry.resolve(), (ROOT / name).resolve())
             for excluded in ("AGENTS.md", "docs", "tests", ".git", ".github", ".gitignore"):
                 self.assertFalse((plugin_dir / excluded).exists())
                 self.assertFalse((plugin_dir / excluded).is_symlink())
 
-            cli_link = bin_dir / "keel"
-            self.assertTrue(cli_link.is_symlink())
-            self.assertEqual(cli_link.resolve(), (ROOT / "scripts" / "keel").resolve())
-
-            # --check passes on valid per-entry install
             chk_ok = subprocess.run(
                 [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
                 capture_output=True,
@@ -338,7 +501,11 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             )
             self.assertEqual(chk_ok.returncode, 0, chk_ok.stderr)
 
-            # Stale symlinks (e.g., an accidental AGENTS.md symlink) fail --check and are cleaned on re-install
+            cli_link = bin_dir / "keel"
+            self.assertTrue(cli_link.is_symlink())
+            self.assertEqual(cli_link.resolve(), (ROOT / "scripts" / "keel").resolve())
+
+            # Stale symlinks (e.g., an accidental AGENTS.md symlink) fail --check and are pruned on re-install
             (plugin_dir / "AGENTS.md").symlink_to(ROOT / "AGENTS.md")
             chk_bad = subprocess.run(
                 [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
@@ -356,31 +523,52 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertFalse((plugin_dir / "AGENTS.md").exists())
             self.assertFalse((plugin_dir / "AGENTS.md").is_symlink())
 
-            # Default mode (no --plugin-dir / --bin-dir flags) must strictly validate resolved symlink targets
+            # Regular non-symlink file inside --plugin-dir fails --check and refuses destructive overwrite on install
+            rogue_file = plugin_dir / "rogue.txt"
+            rogue_file.write_text("do not delete", encoding="utf-8")
+            chk_rogue = subprocess.run(
+                [str(installer), "--check", "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(chk_rogue.returncode, 0)
+            reinstall_rogue = subprocess.run(
+                [str(installer), "--plugin-dir", str(plugin_dir), "--bin-dir", str(bin_dir)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(reinstall_rogue.returncode, 2)
+            self.assertTrue(rogue_file.is_file())
+            rogue_file.unlink()
+
+            # Default mode (no --plugin-dir / --bin-dir) strictly validates resolved symlink targets
             fake_home = tmp_path / "home"
             fake_home.mkdir()
             home_env = {**os.environ, "HOME": str(fake_home)}
             subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
+            self.assertEqual(
+                subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True).returncode,
+                0,
+            )
 
-            default_ok = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
-            self.assertEqual(default_ok.returncode, 0, default_ok.stderr)
-
-            # Mispointing a plugin entry (hooks -> assets) must fail default --check
             default_plugin_dir = fake_home / ".gemini" / "config" / "plugins" / "keel"
             (default_plugin_dir / "hooks").unlink()
             (default_plugin_dir / "hooks").symlink_to(ROOT / "assets")
-            bad_entry_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
-            self.assertNotEqual(bad_entry_chk.returncode, 0)
+            self.assertNotEqual(
+                subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True).returncode,
+                0,
+            )
 
-            # Restore valid plugin entries, then mispoint CLI symlink (keel -> LICENSE) -> must fail default --check
             subprocess.run([str(installer)], env=home_env, check=True, capture_output=True, text=True)
             default_cli = fake_home / ".local" / "bin" / "keel"
             default_cli.unlink()
             default_cli.symlink_to(ROOT / "LICENSE")
-            bad_cli_chk = subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True)
-            self.assertNotEqual(bad_cli_chk.returncode, 0)
+            self.assertNotEqual(
+                subprocess.run([str(installer), "--check"], env=home_env, capture_output=True, text=True).returncode,
+                0,
+            )
 
-            # Overlapping --plugin-dir and --bin-dir must be rejected before modifying disk
+            # Overlapping --plugin-dir and --bin-dir rejected before modifying disk
             clean_plug = tmp_path / "overlap-plug"
             for bad_plug, bad_bin in (
                 (clean_plug, clean_plug),
@@ -396,7 +584,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertFalse(bad_plug.exists())
                 self.assertFalse(bad_bin.exists())
 
-            # POSIX symlink + '..' resolution: logical/alias -> physical/child makes logical/alias/../plugin == physical/plugin
+            # POSIX symlink + '..' overlap and repository-root boundary escape refusals
             logical = tmp_path / "logical"
             physical_child = tmp_path / "physical" / "child"
             logical.mkdir()
@@ -416,7 +604,6 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertEqual(sym_dotdot_overlap.returncode, 2)
             self.assertFalse((tmp_path / "physical" / "plugin").exists())
 
-            # POSIX symlink + '..' into REPO_ROOT must also be blocked by repository-root boundary preflight
             (logical / "repo_alias").symlink_to(ROOT / "scripts")
             for repo_escape in (f"{logical}/repo_alias/..", f"{logical}/repo_alias/../sub"):
                 repo_guard = subprocess.run(

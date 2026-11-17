@@ -23,14 +23,17 @@ class RunRequest:
     output_path: Path
     agy_workspace: str = "inherit"
     extra_git_dirs: tuple[Path, ...] = ()
+    scratch_verify: bool = False
 
 
 class ExecutorAdapter(ABC):
     """Minimal interface to add any new side-agent executor (Codex, Antigravity, Claude CLI, SDK, etc.)."""
 
     name: str = ""
-    # Root instruction filenames this runtime natively discovers and loads from `<workdir>` without prompt injection
+    # Root instruction filenames this runtime natively discovers and loads without prompt injection
     native_agent_docs: tuple[str, ...] = ()
+    # True when host runtime natively injects `rules/AGENTS.md` into `<user_rules>` (e.g., Antigravity plugin)
+    loads_plugin_spine: bool = False
     # True when structured output schema must be written to file by the agent itself (vs enforced by CLI flag)
     inject_schema_in_brief: bool = True
 

@@ -5,8 +5,8 @@
    - Trace what existing behavior and tests protect before changing them.
    - Never weaken, delete, or skip valid assertions, swallow errors, or silently degrade functionality to make checks pass.
    - Use public APIs of third-party packages; never monkey-patch private library internals without explicit human consent.
-3. **Clean repository hygiene:**
-   - Work strictly inside the assigned workspace directory and allowed `Scope`.
-   - Do not bump release version manifests/badges on ordinary feature or fix changes unless explicitly instructed.
-   - Never commit scratch files (`SUMMARY.md`, `HANDOFF.md`, temporary scripts) or secrets.
+3. **Clean worktree & task-ledger hygiene:**
+   - Work strictly inside the assigned `.agents/worktrees/<slug>` workspace and allowed `Scope`; never edit files in the primary checkout or push to git remotes.
+   - You may update `## Progress` and `## Decisions & Findings` in the branch's active task file (`docs/tasks/active/`), but never weaken `## Goal & Why`, `## Bounds`, or `## Done-check` locked on `main`. Report out-of-scope bugs in your completion notes for the orchestrator to open in `docs/tasks/todo/`.
+   - Do not bump release version manifests on ordinary feature/fix branches unless explicitly instructed, and never commit scratch files (`SUMMARY.md`, `HANDOFF.md`, temporary scripts) or secrets.
 4. **Final-state verification:** Run the `Done` verification commands on the final committed state, confirm `git status --porcelain -uall` is completely clean, and report commit SHA(s) plus exact verification results.

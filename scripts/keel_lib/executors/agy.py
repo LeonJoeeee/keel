@@ -19,6 +19,7 @@ VALID_AGY_WORKSPACES = frozenset({"inherit", "share", "branch"})
 class AgyExecutor(ExecutorAdapter):
     name = "agy"
     native_agent_docs = ("AGENTS.md", "GEMINI.md")
+    loads_plugin_spine = True
     inject_schema_in_brief = True  # Native subagent writes structured JSON directly to `output_path`
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
@@ -64,6 +65,7 @@ class AgyExecutor(ExecutorAdapter):
             "invoke_subagent": invoke_args,
             "output_path": str(req.output_path),
             "extra_git_dirs": [str(p) for p in req.extra_git_dirs],
+            "scratch_verify": req.scratch_verify,
         }
 
     def resume(

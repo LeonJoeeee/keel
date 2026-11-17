@@ -1,15 +1,19 @@
-"""Git worktree lifecycle, gitignored root doc syncing, and disposable verification clones."""
+"""Git worktree lifecycle, state helpers, gitignored root doc syncing, and disposable verification clones."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import json
 import os
 from pathlib import Path
 import re
 import shutil
-from typing import Any
+from typing import Any, Iterator
+import urllib.parse
 
 from . import KeelError
-from .env_gh import is_subpath, run_cmd, safe_resolve, same_path
+from .env import is_subpath, run_cmd, safe_resolve, same_path
 
 ROOT_AGENT_DOCS = ("AGENTS.md", "GEMINI.md")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
@@ -32,6 +36,112 @@ def git_dirs(path: str | os.PathLike[str]) -> tuple[Path, Path]:
     common = run_cmd(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path).stdout.strip()
     git_dir = run_cmd(["git", "rev-parse", "--path-format=absolute", "--git-dir"], cwd=path).stdout.strip()
     return safe_resolve(common), safe_resolve(git_dir)
+
+
+def primary_checkout_root(path: str | os.PathLike[str]) -> Path:
+    """Resolve the repository's primary checkout root even when `path` points at a linked worktree."""
+    root = git_toplevel(path)
+    common_dir, git_dir = git_dirs(root)
+    if same_path(common_dir, git_dir):
+        return root
+    if common_dir.name == ".git" and common_dir.parent.is_dir():
+        return safe_resolve(common_dir.parent)
+    raw = run_cmd(["git", "worktree", "list", "--porcelain"], cwd=root).stdout
+    for line in raw.splitlines():
+        if line.startswith("worktree "):
+            wt_candidate = Path(line[9:].strip())
+            if wt_candidate.is_dir():
+                c_dir, g_dir = git_dirs(wt_candidate)
+                if same_path(c_dir, g_dir):
+                    return safe_resolve(wt_candidate)
+    return root
+
+
+def branch_state_path(common_dir: Path, branch_name: str) -> Path:
+    encoded = urllib.parse.quote(branch_name, safe="")
+    return common_dir / "keel-state" / "branches" / f"{encoded}.json"
+
+
+def load_branch_state(common_dir: Path, branch_name: str) -> dict[str, Any]:
+    path = branch_state_path(common_dir, branch_name)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {
+        "branch": branch_name,
+        "dual_required_by_sha": {},
+        "checks_by_sha": {},
+        "verdicts_by_sha": {},
+        "pending_verifiers": {},
+        "rounds": [],
+        "request_changes_rounds": 0,
+        "landed_head_sha": None,
+        "landed_sha": None,
+        "landed_method": None,
+        "discarded": False,
+        "discard_reason": None,
+    }
+
+
+def save_branch_state(common_dir: Path, branch_name: str, state: dict[str, Any]) -> Path:
+    path = branch_state_path(common_dir, branch_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+    return path
+
+
+@contextlib.contextmanager
+def locked_branch_state(common_dir: Path, branch_name: str) -> Iterator[dict[str, Any]]:
+    """Acquire an exclusive flock on `<encoded_branch>.lock`, reload state, yield for mutation, and save atomically."""
+    state_path = branch_state_path(common_dir, branch_name)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            state = load_branch_state(common_dir, branch_name)
+            yield state
+            save_branch_state(common_dir, branch_name, state)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def locked_repo_land(common_dir: Path) -> Iterator[None]:
+    """Acquire an exclusive repo-wide flock on `<common_dir>/keel-state/land.lock` to serialize primary-checkout mutations."""
+    lock_path = common_dir / "keel-state" / "land.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def resolve_base_ref(
+    root: Path,
+    explicit_base: str | None = None,
+    *,
+    allow_head_fallback: bool = False,
+    default_branches: tuple[str, ...] = ("main", "master"),
+) -> str:
+    if explicit_base:
+        if run_cmd(["git", "rev-parse", "--verify", f"{explicit_base}^{{commit}}"], cwd=root, check=False).returncode == 0:
+            return explicit_base
+        raise KeelError(f"Base revision '{explicit_base}' not found in {root}")
+    for candidate in default_branches:
+        if run_cmd(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{candidate}"], cwd=root, check=False).returncode == 0:
+            return candidate
+    if allow_head_fallback and run_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=False).returncode == 0:
+        return "HEAD"
+    raise KeelError(f"Could not find local default branch ({', '.join(default_branches)}) in {root}; pass --base <ref>.")
 
 
 def ensure_agents_dir_ignored(project_root: Path) -> None:
@@ -77,12 +187,12 @@ def create_worktree(
     project: str | os.PathLike[str],
     slug: str,
     *,
-    base: str = "origin/main",
+    base: str = "main",
     branch: str | None = None,
-    fetch: bool = True,
+    fetch: bool = False,
 ) -> dict[str, Any]:
     clean_slug = validate_slug(slug)
-    root = git_toplevel(project)
+    root = primary_checkout_root(project)
     ensure_agents_dir_ignored(root)
 
     wt_path = root / ".agents" / "worktrees" / clean_slug
@@ -93,15 +203,13 @@ def create_worktree(
 
     if fetch and "/" in base:
         remote, ref = base.split("/", 1)
-        # Best-effort fetch when remote exists
         remotes = run_cmd(["git", "remote"], cwd=root).stdout.splitlines()
         if remote in remotes:
             run_cmd(["git", "fetch", "--no-tags", remote, ref], cwd=root)
 
-    # Check if base exists; fall back to HEAD if origin/main does not exist in a fresh local repo
     if run_cmd(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd=root, check=False).returncode != 0:
-        if base == "origin/main" and run_cmd(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=False).returncode == 0:
-            base = "HEAD"
+        if base == "main":
+            base = resolve_base_ref(root, None, allow_head_fallback=True)
         else:
             raise KeelError(f"Base revision '{base}' not found in {root}")
 
@@ -149,13 +257,17 @@ def cleanup_worktree(
     project: str | os.PathLike[str],
     slug: str,
     *,
+    base: str | None = None,
+    base_ref: str | None = None,
+    expected_branch: str | None = None,
     merged_head_sha: str | None = None,
+    keep_branch: bool = False,
     discard: bool = False,
     caller_cwd: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
-    """Safely remove `.agents/worktrees/<slug>` without losing unpublished edits or modified root docs."""
+    """Safely remove `.agents/worktrees/<slug>` without losing unintegrated edits or modified root docs."""
     clean_slug = validate_slug(slug)
-    root = git_toplevel(project)
+    root = primary_checkout_root(project)
     wt_path = root / ".agents" / "worktrees" / clean_slug
     if not wt_path.exists():
         raise KeelError(f"Worktree does not exist: {wt_path}")
@@ -169,11 +281,11 @@ def cleanup_worktree(
     if not same_path(proj_common, wt_common) or same_path(wt_common, wt_git):
         raise KeelError(f"Refusing to remove {wt_path}: not a linked worktree of {root}.")
 
-    expected_branch = f"task/{clean_slug}"
+    target_branch = expected_branch or f"task/{clean_slug}"
     actual_branch = run_cmd(["git", "branch", "--show-current"], cwd=wt_path).stdout.strip()
-    if not discard and actual_branch != expected_branch:
+    if not discard and actual_branch != target_branch:
         raise KeelError(
-            f"Worktree {wt_path} is on branch '{actual_branch}' rather than '{expected_branch}'. "
+            f"Worktree {wt_path} is on branch '{actual_branch}' rather than '{target_branch}'. "
             "Inspect before discarding."
         )
 
@@ -198,28 +310,54 @@ def cleanup_worktree(
 
     wt_head = run_cmd(["git", "rev-parse", "HEAD"], cwd=wt_path).stdout.strip()
     if not discard:
-        if not merged_head_sha:
-            raise KeelError("Provide --pr <merged-pr-number> (or --discard with human authorization) to clean up worktree.")
-        if wt_head != merged_head_sha:
-            raise KeelError(
-                f"Worktree HEAD ({wt_head[:12]}) does not match merged PR head ({merged_head_sha[:12]}); "
-                "unintegrated local commits may exist."
-            )
         if actual_branch:
             branch_tip = run_cmd(["git", "rev-parse", f"refs/heads/{actual_branch}"], cwd=root).stdout.strip()
-            if branch_tip != merged_head_sha:
+            if branch_tip != wt_head:
                 raise KeelError(
-                    f"Branch '{actual_branch}' tip ({branch_tip[:12]}) differs from merged PR head ({merged_head_sha[:12]})."
+                    f"Branch '{actual_branch}' tip ({branch_tip[:12]}) differs from worktree HEAD ({wt_head[:12]})."
                 )
+        if merged_head_sha is not None and wt_head != merged_head_sha:
+            raise KeelError(
+                f"Worktree HEAD ({wt_head[:12]}) does not match expected integrated head ({merged_head_sha[:12]}); "
+                "unintegrated local commits may exist."
+            )
+        effective_base = base_ref if base_ref is not None else base
+        resolved_base = resolve_base_ref(root, effective_base, allow_head_fallback=True)
+        is_ancestor = (
+            run_cmd(["git", "merge-base", "--is-ancestor", wt_head, resolved_base], cwd=root, check=False).returncode == 0
+        )
+        squash_landed = False
+        if not is_ancestor:
+            state = load_branch_state(proj_common, actual_branch or target_branch)
+            landed_head = state.get("landed_head_sha")
+            landed_sha = state.get("landed_sha")
+            if (
+                isinstance(landed_head, str)
+                and landed_head == wt_head
+                and isinstance(landed_sha, str)
+                and landed_sha
+                and run_cmd(
+                    ["git", "merge-base", "--is-ancestor", landed_sha, resolved_base], cwd=root, check=False
+                ).returncode
+                == 0
+            ):
+                squash_landed = True
+        if not is_ancestor and not squash_landed:
+            raise KeelError(
+                f"Worktree HEAD ({wt_head[:12]}) on '{actual_branch or target_branch}' is not integrated into "
+                f"'{resolved_base}'. Land via 'keel branch land {actual_branch or clean_slug}' first or pass --discard with human authorization."
+            )
 
     for wt_doc in docs_to_unlink:
         wt_doc.unlink(missing_ok=True)
 
-    # `--force` removes gitignored build/test caches (__pycache__, .pytest_cache) AFTER porcelain & SHA checks pass
+    # `--force` removes gitignored build/test caches (__pycache__, .pytest_cache) AFTER porcelain & integration checks pass
     run_cmd(["git", "worktree", "remove", "--force", str(wt_path)], cwd=root)
     deleted_branch = None
-    if actual_branch and (
-        run_cmd(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{actual_branch}"], cwd=root, check=False).returncode
+    if (
+        not keep_branch
+        and actual_branch
+        and run_cmd(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{actual_branch}"], cwd=root, check=False).returncode
         == 0
     ):
         run_cmd(["git", "branch", "-D", actual_branch], cwd=root)
@@ -233,7 +371,7 @@ def create_disposable_clone(
     commit_sha: str,
     scratch_root: Path,
 ) -> tuple[Path, Path]:
-    """Create a physically isolated `--no-local` detached checkout at `commit_sha` for clean verification."""
+    """Create a physically isolated, remote-stripped `--no-local` detached checkout at `commit_sha`."""
     root = git_toplevel(project)
     scratch_root.mkdir(parents=True, exist_ok=True)
     sep_git_dir = scratch_root / "git"
@@ -252,15 +390,15 @@ def create_disposable_clone(
             str(checkout_dir),
         ]
     )
-    # Ensure commit_sha is present even if not at a branch tip
+    # Ensure commit_sha is present locally even if not at a default branch tip
     if run_cmd(["git", "cat-file", "-e", f"{commit_sha}^{{commit}}"], cwd=checkout_dir, check=False).returncode != 0:
-        origin_proc = run_cmd(["git", "remote", "get-url", "origin"], cwd=root, check=False)
-        fetch_src = origin_proc.stdout.strip() if origin_proc.returncode == 0 and origin_proc.stdout.strip() else str(root)
-        run_cmd(["git", "fetch", "--quiet", "--no-tags", fetch_src, commit_sha], cwd=checkout_dir)
+        run_cmd(["git", "fetch", "--quiet", "--no-tags", str(root), commit_sha], cwd=checkout_dir)
 
-    origin_proc = run_cmd(["git", "remote", "get-url", "origin"], cwd=root, check=False)
-    if origin_proc.returncode == 0 and origin_proc.stdout.strip():
-        run_cmd(["git", "remote", "set-url", "origin", origin_proc.stdout.strip()], cwd=checkout_dir)
+    # Strip ALL configured git remotes inside the disposable clone so no remote/source URL remains reachable
+    for remote_name in run_cmd(["git", "remote"], cwd=checkout_dir).stdout.splitlines():
+        clean_remote = remote_name.strip()
+        if clean_remote:
+            run_cmd(["git", "remote", "remove", clean_remote], cwd=checkout_dir)
 
     run_cmd(["git", "checkout", "--quiet", "--detach", commit_sha], cwd=checkout_dir)
     sync_gitignored_root_docs(root, checkout_dir)

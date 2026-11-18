@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 from typing import Any
@@ -21,9 +20,8 @@ from keel_lib.branch_gate import (  # noqa: E402
     compare_rebase,
     evaluate_branch_gate,
     land_branch,
-    record_verdict_in_state,
-    resolve_branch_and_slug,
-    validate_verdict_payload,
+    prepare_branch_write,
+    record_branch_write,
     verify_branch,
 )
 from keel_lib.context import (  # noqa: E402
@@ -46,7 +44,6 @@ from keel_lib.worktree import (  # noqa: E402
     cleanup_worktree,
     create_worktree,
     ensure_agents_dir_ignored,
-    git_dirs,
     git_toplevel,
     list_worktrees,
     validate_slug,
@@ -126,6 +123,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     else:
         workdir = caller_cwd
 
+    write_target = prepare_branch_write(workdir, mode, norm_level, defaults)
     task_text = args.task or ""
     if args.task_file:
         task_text = Path(args.task_file).read_text(encoding="utf-8")
@@ -172,26 +170,16 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         effort=args.effort,
         schema_path=schema_path,
         output_path=output_path,
-        agy_workspace=args.agy_workspace,
         scratch_verify=scratch_verify,
     )
-    record: dict[str, Any] = {
-        "run_id": run_id,
-        "executor": adapter.name,
-        "preset": preset,
-        "mode": mode,
-        "workdir": str(workdir),
-        "project_root": str(project_root) if project_root else None,
-        "brief_path": str(brief_path),
-        "schema_path": str(schema_path) if schema_path else None,
-        "level": norm_level,
-    }
+    record = req.run_record(adapter.name)
     try:
         record.update(adapter.execute(req, defaults))
     except KeelExecutionError as exc:
         save_run_record(run_dir, {**record, **exc.partial})
         raise
     save_run_record(run_dir, record)
+    record_branch_write(write_target, adapter.name, record)
     return record
 
 
@@ -205,6 +193,7 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
     if effective_level is not None and record.get("preset") == "verify":
         enforce_verify_min_level(effective_level, defaults)
 
+    write_target = prepare_branch_write(Path(record["workdir"]), record["mode"], effective_level, defaults)
     msg = args.message or ""
     if args.message_file:
         msg = Path(args.message_file).read_text(encoding="utf-8")
@@ -227,6 +216,7 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
         record["level"] = level
     record.update(res)
     save_run_record(run_dir, record)
+    record_branch_write(write_target, adapter.name, record)
     return record
 
 
@@ -242,6 +232,7 @@ def _cmd_branch_verify(args: argparse.Namespace) -> dict[str, Any]:
         base=args.base,
         executor=args.executor,
         dual=args.dual,
+        level=args.level,
         model=args.model,
         effort=args.effort,
         checks=args.check or (),
@@ -253,48 +244,6 @@ def _cmd_branch_verify(args: argparse.Namespace) -> dict[str, Any]:
         force_round=args.force_round,
         caller_cwd=safe_resolve(Path.cwd()),
     )
-
-
-def _cmd_branch_record_verdict(args: argparse.Namespace) -> dict[str, Any]:
-    if _effective_caller_mode(args.project) == "read":
-        raise KeelError("Read-only subagent mode cannot run `keel branch record-verdict`.")
-    proj = git_toplevel(args.project or Path.cwd())
-    common_dir, _ = git_dirs(proj)
-    branch, _slug = resolve_branch_and_slug(proj, args.branch, must_exist=True)
-
-    verdict_file = Path(args.verdict_file)
-    if not verdict_file.is_file():
-        raise KeelError(f"Verdict file not found: {verdict_file}")
-
-    validated = validate_verdict_payload(json.loads(verdict_file.read_text(encoding="utf-8")))
-    state = record_verdict_in_state(
-        common_dir,
-        branch,
-        head_sha=args.head_sha,
-        executor=args.executor,
-        model=args.model,
-        validated_verdict=validated,
-    )
-    cleaned_scratch = False
-    if args.cleanup_scratch:
-        scratch = Path(args.cleanup_scratch)
-        if (
-            scratch.exists()
-            and not scratch.is_symlink()
-            and scratch.name.startswith("keel-verify-")
-            and is_disposable_verify_path(scratch)
-        ):
-            shutil.rmtree(scratch, ignore_errors=True)
-            cleaned_scratch = True
-    return {
-        "branch": branch,
-        "head_sha": args.head_sha.strip().lower(),
-        "executor": args.executor.strip().lower(),
-        "verdict": validated,
-        "request_changes_rounds": state.get("request_changes_rounds", 0),
-        "pending_verifiers": (state.get("pending_verifiers") or {}).get(args.head_sha.strip().lower(), []),
-        "cleaned_scratch": cleaned_scratch,
-    }
 
 
 def _cmd_branch_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -400,7 +349,6 @@ def build_parser() -> argparse.ArgumentParser:
     ag_r.add_argument("--worktree", help="Create/use .agents/worktrees/<slug>.")
     ag_r.add_argument("--base", default="main")
     ag_r.add_argument("--cwd")
-    ag_r.add_argument("--agy-workspace", default="inherit", choices=["inherit", "share", "branch"])
     ag_r.add_argument("--schema", help="Optional JSON Schema file path.")
     ag_r.add_argument("--enforce-verdict-schema", action="store_true")
     ag_r.add_argument("--output")
@@ -412,8 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
     ag_res.add_argument("--message")
     ag_res.add_argument("--message-file")
     ag_res.add_argument("--level", metavar="L1|L2|L3|L4", help="Select a new intensity level for this session.")
-    ag_res.add_argument("--model", help="Codex model override for the resumed session.")
-    ag_res.add_argument("--effort", help="Codex reasoning-effort override for the resumed session.")
+    ag_res.add_argument("--model", help="Model override for the resumed session.")
+    ag_res.add_argument("--effort", help="Reasoning-effort override for the resumed session.")
     ag_res.add_argument("--project")
     ag_res.add_argument("--output")
     ag_res.set_defaults(func=_cmd_agent_resume)
@@ -428,6 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     br_v.add_argument("--base")
     br_v.add_argument("--executor", choices=sorted(EXECUTORS))
     br_v.add_argument("--dual", action="store_true", help="Run both codex and agy independent verifiers.")
+    br_v.add_argument("--level", metavar="L1|L2|L3|L4", help="Verifier intensity level.")
     br_v.add_argument("--model")
     br_v.add_argument("--effort")
     br_v.add_argument("--check", action="append", default=[], help="Deterministic shell check to run in disposable clone.")
@@ -438,16 +387,6 @@ def build_parser() -> argparse.ArgumentParser:
     br_v.add_argument("--output-dir")
     br_v.add_argument("--force-round", action="store_true")
     br_v.set_defaults(func=_cmd_branch_verify)
-
-    br_rec = br_sub.add_parser("record-verdict", help="Validate and record a verdict.json file in .git/keel-state/.")
-    br_rec.add_argument("branch")
-    br_rec.add_argument("--verdict-file", required=True)
-    br_rec.add_argument("--head-sha", required=True)
-    br_rec.add_argument("--executor", default="agy", choices=sorted(EXECUTORS))
-    br_rec.add_argument("--model")
-    br_rec.add_argument("--cleanup-scratch")
-    br_rec.add_argument("--project")
-    br_rec.set_defaults(func=_cmd_branch_record_verdict)
 
     br_st = br_sub.add_parser("status", help="Inspect repo-wide task/worktree overview or a branch's gate status.")
     br_st.add_argument("branch", nargs="?")

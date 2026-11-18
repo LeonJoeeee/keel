@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from . import KeelError, SCHEMAS_DIR
 from .context import assemble_brief, generate_run_id, runs_root_dir, save_run_record
-from .env import run_cmd, safe_resolve, same_path, tool_env
+from .env import check_interrupted, forward_signals_to_child_groups, run_cmd, safe_resolve, same_path, tool_env
 from .executors import RunRequest, get_executor
-from .executors.agy import VALID_AGY_MODELS
+from .executors.base import KeelConfigError, KeelExecutionError, escalate_level, level_rank, max_level, normalize_level
 from .worktree import (
     cleanup_worktree,
     create_disposable_clone,
@@ -36,7 +37,7 @@ _HEX_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def validate_verdict_payload(payload: Any) -> dict[str, Any]:
@@ -271,10 +272,28 @@ def _list_tree_md_files(project: Path, rev: str, subdir: str) -> list[str]:
     )
 
 
+def _read_blob_sha(project: Path, rev: str, rel_path: str) -> str | None:
+    kind = run_cmd(["git", "cat-file", "-t", f"{rev}:{rel_path}"], cwd=project, check=False)
+    if kind.returncode != 0 or kind.stdout.strip() != "blob":
+        return None
+    return run_cmd(["git", "rev-parse", f"{rev}:{rel_path}"], cwd=project).stdout.strip().lower()
+
+
 def _read_blob_text(project: Path, rev: str, rel_path: str) -> str | None:
-    if run_cmd(["git", "cat-file", "-e", f"{rev}:{rel_path}"], cwd=project, check=False).returncode != 0:
+    if _read_blob_sha(project, rev, rel_path) is None:
         return None
     return run_cmd(["git", "show", f"{rev}:{rel_path}"], cwd=project).stdout.strip()
+
+
+def _effective_task_blob_sha(project: Path, base_tip_sha: str, head_sha: str, task_file: str | None) -> str | None:
+    if not task_file:
+        return None
+    sha = _read_blob_sha(project, base_tip_sha, task_file)
+    if sha is None and task_file.startswith("docs/tasks/active/"):
+        sha = _read_blob_sha(project, base_tip_sha, "docs/tasks/todo/" + Path(task_file).name)
+    if sha is None:
+        sha = _read_blob_sha(project, head_sha, task_file)
+    return sha
 
 
 def normalize_task_rel_path(project: Path, raw_task_file: str) -> str:
@@ -290,6 +309,15 @@ def normalize_task_rel_path(project: Path, raw_task_file: str) -> str:
     return rel
 
 
+def _task_exists_in_git(project: Path, base_ref: str, head_sha: str | None, rel: str) -> bool:
+    todo_equiv = ("docs/tasks/todo/" + Path(rel).name) if rel.startswith("docs/tasks/active/") else None
+    return (
+        _read_blob_text(project, base_ref, rel) is not None
+        or (head_sha is not None and _read_blob_text(project, head_sha, rel) is not None)
+        or (todo_equiv is not None and _read_blob_text(project, base_ref, todo_equiv) is not None)
+    )
+
+
 def discover_task_file(
     project: Path,
     branch: str,
@@ -301,14 +329,25 @@ def discover_task_file(
     state_task_file: str | None = None,
 ) -> str | None:
     if explicit_task_file:
-        return normalize_task_rel_path(project, explicit_task_file)
+        rel = normalize_task_rel_path(project, explicit_task_file)
+        if not _task_exists_in_git(project, base_ref, head_sha, rel):
+            raise KeelError(f"--task-file '{rel}' is not committed on '{base_ref}' or '{branch}'.")
+        return rel
+
+    valid_state_task = (
+        state_task_file
+        if state_task_file and _task_exists_in_git(project, base_ref, head_sha, state_task_file)
+        else None
+    )
+    if valid_state_task:
+        return valid_state_task
 
     # Never steal `task/<slug>`'s active task file when operating on a different branch (e.g. `feature/<slug>`)
     if branch != f"task/{slug}" and (
         run_cmd(["git", "show-ref", "--verify", "--quiet", f"refs/heads/task/{slug}"], cwd=project, check=False).returncode
         == 0
     ):
-        return state_task_file
+        return valid_state_task
 
     candidates: list[str] = []
     for rev in ([head_sha, base_ref] if head_sha else [base_ref]):
@@ -327,7 +366,7 @@ def discover_task_file(
         raise KeelError(
             f"Multiple active task files match '{slug}': {', '.join(fuzzy)}. Pass explicit --task-file <path>."
         )
-    return state_task_file
+    return valid_state_task
 
 
 def _find_branch_worktree(project: Path, branch: str) -> Path | None:
@@ -385,165 +424,166 @@ def run_deterministic_checks(project: Path, head_sha: str, commands: Sequence[st
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
-def _add_pending_verifier(state: dict[str, Any], head_sha: str, exec_name: str) -> None:
-    pending_map = state.setdefault("pending_verifiers", {})
-    cur = list(pending_map.get(head_sha) or [])
-    if exec_name not in cur:
-        cur.append(exec_name)
-    pending_map[head_sha] = cur
+def _review_rounds(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fold the last detailed verdict per vendor/SHA into its historical round on upgrade."""
+    rounds = [dict(entry) for entry in state.get("rounds", [])]
+    for sha, by_executor in state.get("verdicts_by_sha", {}).items():
+        remaining = by_executor.copy()
+        for entry in reversed(rounds):
+            if not remaining:
+                break
+            if entry["head_sha"] == sha:
+                for name in remaining.keys() & entry["verdicts"].keys():
+                    entry["verdicts"][name] = remaining.pop(name)
+    return rounds
 
 
-def _remove_pending_verifier(state: dict[str, Any], head_sha: str, exec_name: str) -> None:
-    pending_map = state.setdefault("pending_verifiers", {})
-    if head_sha in pending_map and isinstance(pending_map[head_sha], list):
-        pending_map[head_sha] = [x for x in pending_map[head_sha] if x != exec_name]
-        if not pending_map[head_sha]:
-            pending_map.pop(head_sha, None)
+@contextmanager
+def edit_gate_state(common_dir: Path, branch: str) -> Iterator[dict[str, Any]]:
+    """Use the shared Git lock and persist only the flat gate's fields, including on upgrade."""
+    fields = ("branch", "task_file", "rounds", "last_write", "checks_by_sha", "landed_head_sha",
+              "landed_sha", "landed_method", "discarded", "discard_reason")
+    with locked_branch_state(common_dir, branch) as stored:
+        state = {key: stored[key] for key in fields if key in stored}
+        state["rounds"] = _review_rounds(stored)
+        state.setdefault("checks_by_sha", {})
+        state.setdefault("last_write", None)
+        yield state
+        stored.clear()
+        stored.update(state)
 
 
-def _join_or_create_round(
-    state: dict[str, Any],
-    *,
-    head_sha: str,
-    dual: bool,
-    exec_name: str,
-    slug: str,
-    branch: str = "",
-    max_rounds: int | None = None,
-    force_round: bool = False,
+def _run_and_record_checks(
+    project: Path, common_dir: Path, branch: str, head_sha: str, commands: Sequence[str],
 ) -> dict[str, Any]:
-    rounds: list[dict[str, Any]] = state.setdefault("rounds", [])
-    if dual:
-        state.setdefault("dual_required_by_sha", {})[head_sha] = True
-        for r in reversed(rounds):
-            if (
-                r.get("head_sha") == head_sha
-                and r.get("dual") is True
-                and not r.get("completed")
-                and exec_name not in (r.get("verdicts") or {})
-            ):
-                r["expected_executors"] = ["codex", "agy"]
-                return r
-        if max_rounds is not None and not force_round and int(state.get("request_changes_rounds", 0)) >= max_rounds:
-            raise KeelError(
-                f"Branch '{branch or slug}' already has {state['request_changes_rounds']} 'request_changes' rounds "
-                f"(>= {max_rounds}-round convergence cap). Stop looping and escalate to the human (or pass --force-round if authorized)."
-            )
-        round_entry = {
-            "round_id": generate_run_id(f"round-{slug}"),
-            "head_sha": head_sha,
-            "dual": True,
-            "expected_executors": ["codex", "agy"],
-            "verdicts": {},
-            "completed": False,
-            "counted_request_changes": False,
-            "outcome": "pending",
-        }
-        rounds.append(round_entry)
-        return round_entry
-
-    if max_rounds is not None and not force_round and int(state.get("request_changes_rounds", 0)) >= max_rounds:
-        raise KeelError(
-            f"Branch '{branch or slug}' already has {state['request_changes_rounds']} 'request_changes' rounds "
-            f"(>= {max_rounds}-round convergence cap). Stop looping and escalate to the human (or pass --force-round if authorized)."
-        )
-    # Non-dual single-executor verify resets stale dual requirement & clears stale pending verifiers on `head_sha`
-    state.setdefault("dual_required_by_sha", {})[head_sha] = False
-    state.setdefault("pending_verifiers", {}).pop(head_sha, None)
-    round_entry = {
-        "round_id": generate_run_id(f"round-{slug}"),
-        "head_sha": head_sha,
-        "dual": False,
-        "expected_executors": [exec_name],
-        "verdicts": {},
-        "completed": False,
-        "counted_request_changes": False,
-        "outcome": "pending",
-    }
-    rounds.append(round_entry)
-    return round_entry
+    batch = run_deterministic_checks(project, head_sha, commands)
+    with edit_gate_state(common_dir, branch) as state:
+        checks_by_sha = state["checks_by_sha"]
+        previous = checks_by_sha.get(head_sha, {})
+        by_command = {c["command"]: c for c in previous.get("commands", [])}
+        by_command.update((c["command"], c) for c in batch["commands"])
+        # A fail-fast batch can declare new checks that it never reached.
+        for command in commands:
+            if command not in by_command:
+                by_command[command] = {
+                    "command": command, "ok": False, "returncode": None,
+                    "output_tail": "Not run after an earlier check failed.",
+                }
+        results = list(by_command.values())
+        merged = {**batch, "commands": results, "ok": all(c["ok"] for c in results)}
+        checks_by_sha[head_sha] = merged
+    return merged
 
 
-def _has_joinable_open_dual_round(state: dict[str, Any], head_sha: str, dual: bool, executor: str | None) -> bool:
-    if not dual or executor not in ("codex", "agy"):
-        return False
-    for r in reversed(state.get("rounds") or []):
-        if (
-            r.get("head_sha") == head_sha
-            and r.get("dual") is True
-            and not r.get("completed")
-            and executor in (r.get("expected_executors") or [])
-            and executor not in (r.get("verdicts") or {})
-        ):
-            return True
-    return False
-
-
-def record_verdict_in_state(
-    common_dir: Path,
-    branch: str,
-    *,
-    head_sha: str,
-    executor: str,
-    model: str | None,
-    validated_verdict: dict[str, Any],
-) -> dict[str, Any]:
-    norm_sha = head_sha.strip().lower()
-    if not _HEX_SHA_RE.fullmatch(norm_sha):
-        raise KeelError(f"--head-sha must be a full 40/64-character commit SHA (got '{head_sha}').")
-
-    exec_key = executor.strip().lower()
-    with locked_branch_state(common_dir, branch) as state:
-        state["branch"] = branch
-
-        verdicts_by_sha = state.setdefault("verdicts_by_sha", {})
-        sha_verdicts = verdicts_by_sha.setdefault(norm_sha, {})
-        sha_verdicts[exec_key] = {
-            "executor": exec_key,
-            "model": model,
-            **validated_verdict,
+def _record_skipped_checks(common_dir: Path, branch: str, head_sha: str, reason: str) -> None:
+    with edit_gate_state(common_dir, branch) as state:
+        checks_by_sha = state["checks_by_sha"]
+        previous = checks_by_sha.get(head_sha) or {}
+        checks_by_sha[head_sha] = {
+            "configured": True,
+            "ok": True,
+            "skipped": True,
+            "skip_reason": reason.strip(),
+            "commands": list(previous.get("commands") or []),
             "recorded_at": _now_iso(),
         }
-        _remove_pending_verifier(state, norm_sha, exec_key)
 
-        rounds: list[dict[str, Any]] = state.setdefault("rounds", [])
-        target_round: dict[str, Any] | None = None
-        for r in reversed(rounds):
-            if r.get("head_sha") == norm_sha and not r.get("completed") and exec_key in (r.get("expected_executors") or []):
-                target_round = r
-                break
-        if target_round is None:
-            latest_for_sha = next((r for r in reversed(rounds) if r.get("head_sha") == norm_sha), None)
-            if latest_for_sha is not None and (
-                exec_key in (latest_for_sha.get("expected_executors") or [])
-                or exec_key in (latest_for_sha.get("verdicts") or {})
-            ):
-                target_round = latest_for_sha
-        if target_round is None:
-            is_dual = bool((state.get("dual_required_by_sha") or {}).get(norm_sha, False))
-            target_round = {
-                "round_id": generate_run_id("round"),
-                "head_sha": norm_sha,
-                "dual": is_dual,
-                "expected_executors": ["codex", "agy"] if is_dual else [exec_key],
-                "verdicts": {},
-                "completed": False,
-                "counted_request_changes": False,
-                "outcome": "pending",
-            }
-            rounds.append(target_round)
 
-        round_verdicts = target_round.setdefault("verdicts", {})
-        round_verdicts[exec_key] = validated_verdict["verdict"]
+def _rework_floor(rounds: list[dict[str, Any]]) -> str | None:
+    if not rounds or rounds[-1]["outcome"] != "request_changes":
+        return None
+    latest = rounds[-1]
+    # Reviews recorded before the tier ladder use the manual-review baseline.
+    return escalate_level(latest.get("implement_level") or latest.get("level") or "L3")
 
-        has_rc = any(v == "request_changes" for v in round_verdicts.values())
-        target_round["counted_request_changes"] = has_rc
-        expected_set = set(target_round.get("expected_executors") or [exec_key])
-        target_round["completed"] = expected_set <= set(round_verdicts.keys())
-        target_round["outcome"] = "request_changes" if has_rc else ("approve" if target_round["completed"] else "pending")
-        state["request_changes_rounds"] = sum(1 for r in rounds if r.get("counted_request_changes"))
 
-        return dict(state)
+def prepare_branch_write(
+    workdir: Path, mode: str, level: str | None, defaults: dict[str, Any],
+) -> tuple[Path, str] | None:
+    if mode != "write":
+        return None
+    branch = run_cmd(["git", "branch", "--show-current"], cwd=workdir, check=False).stdout.strip()
+    if not branch or branch in defaults.get("default_branches", ("main", "master")):
+        return None
+    if level is None:
+        raise KeelConfigError(f"Resume with --level to record the implementation tier on '{branch}'.")
+    common_dir, _ = git_dirs(workdir)
+    state = load_branch_state(common_dir, branch)
+    rounds = state.get("rounds", [])
+    floor = _rework_floor(rounds)
+    last_write = state.get("last_write") or {}
+    if floor and last_write.get("reworked_round") != len(rounds) and level_rank(level) < level_rank(floor):
+        raise KeelConfigError(f"Rework on '{branch}' requires --level {floor} or higher.")
+    return common_dir, branch
+
+
+def record_branch_write(target: tuple[Path, str] | None, executor: str, result: dict[str, Any]) -> None:
+    if target is None or result.get("status") != "completed":
+        return
+    level = result["level"]
+    with edit_gate_state(*target) as state:
+        write = {"executor": executor, "level": level, "recorded_at": _now_iso()}
+        rounds = state["rounds"]
+        floor = _rework_floor(rounds)
+        if floor:
+            previous = state.get("last_write") or {}
+            if level_rank(level) >= level_rank(floor) or previous.get("reworked_round") == len(rounds):
+                write["reworked_round"] = len(rounds)
+        state["last_write"] = write
+
+
+def _request_changes_count(rounds: Sequence[dict[str, Any]]) -> int:
+    return sum(r["outcome"] == "request_changes" for r in rounds)
+
+
+def _verify_one(
+    executor: str, *, project: Path, branch: str, head_sha: str, slug: str, task: str,
+    why: str, level: str, model: str | None, effort: str | None, defaults: dict[str, Any],
+    caller_cwd: Path | None, output_dir: Path | None,
+) -> dict[str, Any]:
+    adapter = get_executor(executor)
+    run_id = generate_run_id(f"verify-{slug}-{executor}")
+    run_dir = runs_root_dir(project, Path(tempfile.gettempdir())) / run_id
+    run_dir.mkdir(parents=True)
+    scratch = output_dir or Path(tempfile.mkdtemp(prefix=f"keel-verify-{slug}-{executor}-"))
+    try:
+        checkout, git_dir = create_disposable_clone(project, head_sha, scratch)
+        schema = SCHEMAS_DIR / "verdict.schema.json"
+        verdict_file = (output_dir or run_dir) / "verdict.json"
+        if verdict_file.exists():
+            raise KeelError(f"Verdict output already exists: {verdict_file}")
+        req = RunRequest(
+            run_id=run_id, run_dir=run_dir, brief_path=run_dir / "brief.md", project_root=project,
+            workdir=checkout, mode="read", preset="verify", level=level, model=model, effort=effort,
+            schema_path=schema, output_path=verdict_file, extra_git_dirs=(git_dir,), scratch_verify=True,
+        )
+        req.brief_path.write_text(assemble_brief(
+            why=why, task=task, preset=req.preset, mode=req.mode, workdir=checkout, project_root=project,
+            native_agent_docs=adapter.native_agent_docs, loads_plugin_spine=adapter.loads_plugin_spine,
+            caller_cwd=caller_cwd, schema_path=schema, output_path=verdict_file,
+            inject_schema_in_brief=adapter.inject_schema_in_brief,
+        ), encoding="utf-8")
+        record = {
+            **req.run_record(executor), "branch": branch, "head_sha": head_sha, "ephemeral": True,
+        }
+        try:
+            record.update(adapter.execute(req, defaults))
+            if record.get("status") != "completed":
+                raise KeelError(f"Verifier {executor} did not complete.")
+            verdict = validate_verdict_payload(json.loads(verdict_file.read_text(encoding="utf-8")))
+        except (OSError, ValueError, KeelError) as exc:
+            if isinstance(exc, KeelExecutionError):
+                record.update(exc.partial)
+            save_run_record(run_dir, {**record, "status": "failed"})
+            if isinstance(exc, KeelError):
+                raise
+            raise KeelError(f"Invalid verifier output from {executor}: {exc}") from exc
+        save_run_record(run_dir, record)
+        return {"executor": executor, "run_id": run_id, "status": "completed",
+                "model": record.get("model"), "level": level, "verdict": verdict}
+    finally:
+        if output_dir is None:
+            shutil.rmtree(scratch)
 
 
 def verify_branch(
@@ -554,6 +594,7 @@ def verify_branch(
     base: str | None = None,
     executor: str | None = None,
     dual: bool = False,
+    level: str | None = None,
     model: str | None = None,
     effort: str | None = None,
     checks: Sequence[str] = (),
@@ -570,6 +611,9 @@ def verify_branch(
     if skip_checks is not None and not skip_checks.strip():
         raise KeelError("--skip-checks requires a non-empty reason.")
 
+    if dual and any(value is not None for value in (executor, model, effort)):
+        raise KeelConfigError("--dual selects both executors. Use --level to select their tier.")
+
     project = primary_checkout_root(project)
     ensure_agents_dir_ignored(project)
     common_dir, _ = git_dirs(project)
@@ -582,6 +626,8 @@ def verify_branch(
     merge_base_sha = run_cmd(["git", "merge-base", base_tip_sha, head_sha], cwd=project).stdout.strip().lower()
 
     linked_wt = _find_branch_worktree(project, branch)
+    if linked_wt is None and run_cmd(["git", "branch", "--show-current"], cwd=project).stdout.strip() == branch:
+        linked_wt = project
     if linked_wt is not None and linked_wt.is_dir():
         porcelain = run_cmd(["git", "status", "--porcelain", "-uall"], cwd=linked_wt).stdout.strip()
         if porcelain:
@@ -592,12 +638,24 @@ def verify_branch(
 
     initial_state = load_branch_state(common_dir, branch)
     max_rounds = int(defaults.get("max_review_rounds", 2))
-    joining_open_dual = _has_joinable_open_dual_round(initial_state, head_sha, dual, executor)
-    if int(initial_state.get("request_changes_rounds", 0)) >= max_rounds and not force_round and not joining_open_dual:
-        raise KeelError(
-            f"Branch '{branch}' already has {initial_state['request_changes_rounds']} 'request_changes' rounds "
-            f"(>= {max_rounds}-round convergence cap). Stop looping and escalate to the human (or pass --force-round if authorized)."
-        )
+
+    def check_round_limit(state: dict[str, Any]) -> None:
+        rejected = _request_changes_count(state.get("rounds", []))
+        if rejected >= max_rounds and not force_round:
+            raise KeelError(f"Branch '{branch}' reached its {max_rounds}-round convergence cap. "
+                            "Escalate to the human or pass --force-round if authorized.")
+
+    check_round_limit(initial_state)
+    last_write = initial_state.get("last_write") or {}
+    implement_level = last_write.get("level")
+    minimum = normalize_level(defaults["verify_min_level"])
+    if implement_level:
+        minimum = max_level(minimum, implement_level)
+    if level is None:
+        level = minimum if implement_level else "L3"
+    level = normalize_level(level)
+    if level_rank(level) < level_rank(minimum):
+        raise KeelConfigError(f"Verification requires --level {minimum} or higher, got {level}.")
 
     task_file = discover_task_file(
         project,
@@ -608,43 +666,32 @@ def verify_branch(
         explicit_task_file=task_file_arg,
         state_task_file=initial_state.get("task_file"),
     )
-
-    with locked_branch_state(common_dir, branch) as state:
-        state["branch"] = branch
-        state["slug"] = slug
-        state["base_ref"] = base_ref
-        if task_file:
+    if task_file and task_file != initial_state.get("task_file"):
+        with edit_gate_state(common_dir, branch) as state:
             state["task_file"] = task_file
 
     # 1. Deterministic checks run unlocked, then merge into latest state under `flock`
     if checks:
-        chk_res = run_deterministic_checks(project, head_sha, checks)
-        with locked_branch_state(common_dir, branch) as state:
-            state.setdefault("checks_by_sha", {})[head_sha] = chk_res
+        chk_res = _run_and_record_checks(project, common_dir, branch, head_sha, checks)
         if not chk_res["ok"]:
-            failed = next((c for c in chk_res["commands"] if not c["ok"]), chk_res["commands"][-1])
+            failed = next(c for c in chk_res["commands"] if not c["ok"])
+            if failed["returncode"] is None:
+                raise KeelError(f"Required deterministic check has not run: {failed['command']}")
             raise KeelError(
                 f"Deterministic check failed ({failed['returncode']}): {failed['command']}\n{failed['output_tail']}".strip()
             )
     elif skip_checks:
-        with locked_branch_state(common_dir, branch) as state:
-            state.setdefault("checks_by_sha", {})[head_sha] = {
-                "configured": True,
-                "ok": True,
-                "skipped": True,
-                "skip_reason": skip_checks.strip(),
-                "commands": [],
-                "recorded_at": _now_iso(),
-            }
+        _record_skipped_checks(common_dir, branch, head_sha, skip_checks)
 
     # 2. Build locked task spec & verification context
     locked_spec: str | None = None
     if task_file:
-        locked_spec = _read_blob_text(project, base_ref, task_file)
+        locked_spec = _read_blob_text(project, base_tip_sha, task_file)
         if locked_spec is None and task_file.startswith("docs/tasks/active/"):
             todo_equiv = "docs/tasks/todo/" + Path(task_file).name
-            locked_spec = _read_blob_text(project, base_ref, todo_equiv)
+            locked_spec = _read_blob_text(project, base_tip_sha, todo_equiv)
     branch_spec = _read_blob_text(project, head_sha, task_file) if task_file else None
+    task_blob_sha = _effective_task_blob_sha(project, base_tip_sha, head_sha, task_file)
 
     commit_log = run_cmd(["git", "log", "--oneline", f"{merge_base_sha}..{head_sha}"], cwd=project).stdout.strip()
     extra_ctx = Path(context_file).read_text(encoding="utf-8").strip() if context_file else ""
@@ -675,206 +722,60 @@ def verify_branch(
     if extra_ctx:
         task_lines.extend(["", "### Additional Context", extra_ctx])
 
+    def review(name: str) -> dict[str, Any]:
+        dest = safe_resolve(output_dir) if output_dir else None
+        return _verify_one(
+            name, project=project, branch=branch, head_sha=head_sha, slug=slug.replace("/", "-"),
+            task="\n".join(task_lines), why=why_text, level=level, model=model, effort=effort,
+            defaults=defaults, caller_cwd=caller_cwd, output_dir=dest / name if dual and dest else dest,
+        )
+
     if dual:
-        if executor:
-            if executor not in ("codex", "agy"):
-                raise KeelError("--dual supports 'codex' and 'agy' executors.")
-            executors_to_run = [executor]
-        else:
-            # Prepare `agy` descriptor first, then run `codex` synchronously
-            executors_to_run = ["agy", "codex"]
+        with forward_signals_to_child_groups():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                runs = {run["executor"]: run for run in pool.map(review, ("codex", "agy"))}
+            check_interrupted()
     else:
-        executors_to_run = [executor or defaults.get("routing", {}).get("verify", "codex")]
+        diagonal = {"agy": "codex", "codex": "agy"}
+        name = executor or diagonal.get(last_write.get("executor")) or defaults["routing"]["verify"]
+        single_run = review(name)
+        runs = {name: single_run}
 
-    schema_path = SCHEMAS_DIR / "verdict.schema.json"
-    runs_out: dict[str, Any] = {}
-    prepared_agy_scratch_in_this_call: Path | None = None
-
-    for exec_name in executors_to_run:
-        adapter = get_executor(exec_name)
-        run_id = generate_run_id(f"verify-{slug}-{exec_name}")
-        if output_dir:
-            scratch_root = (Path(output_dir) / exec_name) if (dual and not executor) else Path(output_dir)
-        else:
-            scratch_root = Path(tempfile.mkdtemp(prefix=f"keel-verify-{slug}-{exec_name}-"))
-
-        eff_model = model
-        if dual and not executor and model is not None:
-            if exec_name == "agy" and model not in VALID_AGY_MODELS:
-                eff_model = None
-            elif exec_name == "codex" and model in VALID_AGY_MODELS and model != "inherit":
-                eff_model = None
-
-        registered_sync_pending = False
-        try:
-            checkout_dir, sep_git_dir = create_disposable_clone(project, head_sha, scratch_root)
-            run_dir = runs_root_dir(project, Path(tempfile.gettempdir())) / run_id
-            run_dir.mkdir(parents=True, exist_ok=True)
-            verdict_path = scratch_root / "verdict.json"
-            brief_path = run_dir / "brief.md"
-
-            brief_path.write_text(
-                assemble_brief(
-                    why=why_text,
-                    task="\n".join(task_lines),
-                    preset="verify",
-                    mode="read",
-                    workdir=checkout_dir,
-                    project_root=project,
-                    native_agent_docs=adapter.native_agent_docs,
-                    loads_plugin_spine=adapter.loads_plugin_spine,
-                    caller_cwd=caller_cwd or Path.cwd(),
-                    schema_path=schema_path,
-                    output_path=verdict_path,
-                    inject_schema_in_brief=adapter.inject_schema_in_brief,
-                ),
-                encoding="utf-8",
-            )
-
-            req = RunRequest(
-                run_id=run_id,
-                run_dir=run_dir,
-                brief_path=brief_path,
-                workdir=checkout_dir,
-                project_root=project,
-                mode="read",
-                preset="verify",
-                model=eff_model,
-                effort=effort,
-                schema_path=schema_path,
-                output_path=verdict_path,
-                extra_git_dirs=(sep_git_dir,),
-                scratch_verify=True,
-            )
-
-            if adapter.name != "agy":
-                # Join/create round under `flock` BEFORE blocking on synchronous CLI execution
-                with locked_branch_state(common_dir, branch) as state:
-                    r = _join_or_create_round(
-                        state,
-                        head_sha=head_sha,
-                        dual=dual,
-                        exec_name=adapter.name,
-                        slug=slug,
-                        branch=branch,
-                        max_rounds=max_rounds,
-                        force_round=force_round,
-                    )
-                    if dual and adapter.name not in (r.get("verdicts") or {}):
-                        _add_pending_verifier(state, head_sha, adapter.name)
-                        registered_sync_pending = True
-
-            exec_res = adapter.execute(req, defaults)
-            if exec_res.get("status") != "completed":
-                record_cmd = (
-                    f"keel branch record-verdict {shlex.quote(branch)} --project {shlex.quote(str(project))} "
-                    f"--verdict-file {shlex.quote(str(verdict_path))} --head-sha {shlex.quote(head_sha)} "
-                    f"--executor {shlex.quote(adapter.name)} --cleanup-scratch {shlex.quote(str(scratch_root))}"
-                )
-                rec = {
-                    "run_id": run_id,
-                    "executor": adapter.name,
-                    "preset": "verify",
-                    "mode": "read",
-                    "scratch_verify": True,
-                    "workdir": str(checkout_dir),
-                    "project_root": str(project),
-                    "brief_path": str(brief_path),
-                    "schema_path": str(schema_path),
-                    "branch": branch,
-                    "head_sha": head_sha,
-                    "scratch_root": str(scratch_root),
-                    "verdict_path": str(verdict_path),
-                    "record_verdict_command": record_cmd,
-                    **exec_res,
-                }
-                save_run_record(run_dir, rec)
-                # Persist `pending_verifiers` ONLY after clone + brief + run.json succeeded!
-                with locked_branch_state(common_dir, branch) as state:
-                    r = _join_or_create_round(
-                        state,
-                        head_sha=head_sha,
-                        dual=dual,
-                        exec_name=adapter.name,
-                        slug=slug,
-                        branch=branch,
-                        max_rounds=max_rounds,
-                        force_round=force_round,
-                    )
-                    if adapter.name not in (r.get("verdicts") or {}):
-                        _add_pending_verifier(state, head_sha, adapter.name)
-                prepared_agy_scratch_in_this_call = scratch_root
-                runs_out[adapter.name] = rec
-                continue
-
-            verdict_raw = json.loads(verdict_path.read_text(encoding="utf-8"))
-            validated = validate_verdict_payload(verdict_raw)
-            updated_state = record_verdict_in_state(
-                common_dir,
-                branch,
-                head_sha=head_sha,
-                executor=adapter.name,
-                model=exec_res.get("model"),
-                validated_verdict=validated,
-            )
-            if not output_dir and scratch_root.exists():
-                shutil.rmtree(scratch_root, ignore_errors=True)
-            runs_out[adapter.name] = {
-                "run_id": run_id,
-                "status": "completed",
-                "executor": adapter.name,
-                "model": exec_res.get("model"),
-                "verdict": validated,
-                "request_changes_rounds": updated_state.get("request_changes_rounds", 0),
-            }
-        except Exception:
-            if registered_sync_pending or (prepared_agy_scratch_in_this_call is not None and not executor):
-                with locked_branch_state(common_dir, branch) as state:
-                    if registered_sync_pending:
-                        _remove_pending_verifier(state, head_sha, adapter.name)
-                    if prepared_agy_scratch_in_this_call is not None and not executor:
-                        _remove_pending_verifier(state, head_sha, "agy")
-            if not output_dir:
-                if scratch_root.exists():
-                    shutil.rmtree(scratch_root, ignore_errors=True)
-                if prepared_agy_scratch_in_this_call is not None and not executor and prepared_agy_scratch_in_this_call.exists():
-                    shutil.rmtree(prepared_agy_scratch_in_this_call, ignore_errors=True)
-            raise
-
-    final_state = load_branch_state(common_dir, branch)
-    if not dual:
-        single = runs_out[executors_to_run[0]]
-        return {
-            "branch": branch,
-            "slug": slug,
-            "base_ref": base_ref,
-            "head_sha": head_sha,
-            "dual": False,
-            "task_file": task_file,
-            "request_changes_rounds": final_state.get("request_changes_rounds", 0),
-            **single,
-        }
-    base_payload: dict[str, Any] = {
-        "branch": branch,
-        "slug": slug,
-        "base_ref": base_ref,
-        "head_sha": head_sha,
-        "dual": True,
-        "task_file": task_file,
-        "verifiers": runs_out,
-        "pending_verifiers": (final_state.get("pending_verifiers") or {}).get(head_sha, []),
-        "request_changes_rounds": final_state.get("request_changes_rounds", 0),
+    verdicts = {name: run["verdict"] for name, run in runs.items()}
+    approved = all(verdict["verdict"] == "approve" for verdict in verdicts.values())
+    outcome = "approve" if approved else "request_changes"
+    with edit_gate_state(common_dir, branch) as state:
+        check_round_limit(state)
+        state["rounds"].append({
+            "head_sha": head_sha, "merge_base_sha": merge_base_sha, "task_file": task_file,
+            "task_blob_sha": task_blob_sha, "dual": dual, "level": level,
+            "implement_level": implement_level, "outcome": outcome, "verdicts": verdicts,
+            "recorded_at": _now_iso(),
+        })
+        if task_file:
+            state["task_file"] = task_file
+        rejected = _request_changes_count(state["rounds"])
+    return {
+        "branch": branch, "slug": slug, "base_ref": base_ref, "head_sha": head_sha,
+        "task_file": task_file, "level": level, "dual": dual, "outcome": outcome,
+        "request_changes_rounds": rejected, **({"verifiers": runs} if dual else single_run),
     }
-    if executor and executor in runs_out:
-        return {**runs_out[executor], **base_payload}
-    return base_payload
 
 
-def _validate_old_rebase_pair(old_base: str | None, old_head: str | None) -> None:
+def _validate_old_rebase_pair(project: Path | None, old_base: str | None, old_head: str | None) -> None:
     has_base = bool(old_base and old_base.strip())
     has_head = bool(old_head and old_head.strip())
     if (old_base is not None or old_head is not None) and (not has_base or not has_head):
         raise KeelError("--old-base and --old-head must both be provided together.")
+    if has_base and has_head:
+        assert old_base is not None and old_head is not None
+        for label, raw_sha in (("old-base", old_base.strip()), ("old-head", old_head.strip())):
+            if not _HEX_SHA_RE.fullmatch(raw_sha):
+                raise KeelError(f"--{label} must be a full 40/64-character commit SHA (got '{raw_sha}').")
+            if project is not None:
+                chk = run_cmd(["git", "cat-file", "-e", f"{raw_sha}^{{commit}}"], cwd=project, check=False)
+                if chk.returncode != 0:
+                    raise KeelError(f"Commit for --{label} ({raw_sha}) is not present in {project}.")
 
 
 def evaluate_branch_gate(
@@ -894,8 +795,8 @@ def evaluate_branch_gate(
     state_override: dict[str, Any] | None = None,
     precomputed_rebase_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    _validate_old_rebase_pair(old_base, old_head)
     project = primary_checkout_root(project)
+    _validate_old_rebase_pair(project, old_base, old_head)
     common_dir, _ = git_dirs(project)
     branch, slug = resolve_branch_and_slug(project, branch_or_slug, must_exist=True)
     base_ref = resolve_base_ref(project, base, default_branches=tuple(default_branches))
@@ -908,6 +809,8 @@ def evaluate_branch_gate(
     has_ahead_commits = head_sha != base_tip_sha
     anc = run_cmd(["git", "merge-base", "--is-ancestor", base_tip_sha, head_sha], cwd=project, check=False)
     ancestry_ok = anc.returncode == 0 and has_ahead_commits
+    mb_proc = run_cmd(["git", "merge-base", base_tip_sha, head_sha], cwd=project, check=False)
+    merge_base_sha = mb_proc.stdout.strip().lower() if mb_proc.returncode == 0 else ""
     has_tree_diff = (
         has_ahead_commits
         and run_cmd(["git", "diff", "--quiet", base_tip_sha, head_sha], cwd=project, check=False).returncode != 0
@@ -926,11 +829,13 @@ def evaluate_branch_gate(
 
     checks_map = state.get("checks_by_sha") or {}
     checks_for_head = checks_map.get(head_sha) or {"configured": False, "ok": True, "skipped": False, "commands": []}
-    verdicts_map = state.get("verdicts_by_sha") or {}
-    verdicts_for_head: dict[str, Any] = verdicts_map.get(head_sha) or {}
-    dual_required = bool((state.get("dual_required_by_sha") or {}).get(head_sha, False))
-    pending_for_head: list[str] = list((state.get("pending_verifiers") or {}).get(head_sha, []))
-    rc_rounds = int(state.get("request_changes_rounds", 0))
+    rounds = _review_rounds(state)
+
+    def latest_for(sha: str) -> dict[str, Any]:
+        return next((entry for entry in reversed(rounds) if entry["head_sha"] == sha), {})
+
+    current = latest_for(head_sha)
+    rc_rounds = _request_changes_count(rounds)
 
     approval_source: str | None = None
     rebase_proof: dict[str, Any] | None = None
@@ -955,56 +860,68 @@ def evaluate_branch_gate(
         blockers.append(f"Branch '{branch}' ({head_sha[:12]}) has an empty net diff against '{base_ref}'.")
 
     if checks_for_head.get("configured") and not checks_for_head.get("ok"):
-        blockers.append(f"Deterministic checks failed on commit {head_sha[:12]}.")
+        outstanding = [c["command"] for c in checks_for_head.get("commands", []) if not c["ok"]]
+        blockers.append("\n".join([f"Deterministic checks failed on commit {head_sha[:12]}.", *outstanding]))
 
-    # Current-head rejection ALWAYS takes precedence over older pre-rebase approvals!
-    has_current_rejection = any(v.get("verdict") == "request_changes" for v in verdicts_for_head.values())
-    if has_current_rejection:
-        if human_override and human_override.strip():
-            approval_source = f"human-override:{human_override.strip()}"
-        else:
-            blockers.append(f"Commit {head_sha[:12]} carries an active 'request_changes' verdict.")
-    elif dual_required:
-        codex_ok = (verdicts_for_head.get("codex") or {}).get("verdict") == "approve"
-        agy_ok = (verdicts_for_head.get("agy") or {}).get("verdict") == "approve"
-        if codex_ok and agy_ok and not pending_for_head:
-            approval_source = f"dual-approve:{head_sha[:12]}"
+    missing_rebase_checks: set[str] = set()
+    if old_base and old_head:
+        old_head_lc = old_head.strip().lower()
+        old_checks = checks_map.get(old_head_lc) or {}
+        previous_commands = {item["command"] for item in old_checks.get("commands", [])}
+        rerun_commands = {item["command"] for item in checks_for_head.get("commands", []) if item["ok"]}
+        missing_rebase_checks = previous_commands - rerun_commands
+        if missing_rebase_checks:
+            missing = ", ".join(sorted(missing_rebase_checks))
+            blockers.append(
+                f"Pure rebase from {old_head_lc[:12]} requires re-running deterministic checks "
+                f"on {head_sha[:12]}: {missing}"
+            )
+
+    expected_task_blob = _effective_task_blob_sha(project, base_tip_sha, head_sha, task_file)
+
+    def _round_matches_scope(entry: dict[str, Any], *, expected_merge_base: str) -> bool:
+        return (
+            "task_file" in entry
+            and entry["task_file"] == task_file
+            and "task_blob_sha" in entry
+            and entry["task_blob_sha"] == expected_task_blob
+            and bool(expected_merge_base)
+            and entry.get("merge_base_sha") == expected_merge_base
+        )
+
+    if current.get("outcome") == "approve":
+        if _round_matches_scope(current, expected_merge_base=merge_base_sha):
+            source = "dual-approve" if current.get("dual") else "direct-approve"
+            approval_source = f"{source}:{head_sha[:12]}"
         elif human_override and human_override.strip():
             approval_source = f"human-override:{human_override.strip()}"
         else:
-            missing = [ex for ex, ok in (("codex", codex_ok), ("agy", agy_ok)) if not ok]
             blockers.append(
-                f"Dual verification on {head_sha[:12]} requires unanimous 'approve' from both codex and agy "
-                f"(missing/pending: {', '.join(missing or pending_for_head)})."
+                f"Latest approval on commit {head_sha[:12]} does not match target merge-base "
+                f"({merge_base_sha[:12] or 'none'}) and locked task criteria ({task_file!r}); run fresh verification."
             )
-    elif verdicts_for_head and all(v.get("verdict") == "approve" for v in verdicts_for_head.values()) and not pending_for_head:
-        approval_source = f"direct-approve:{head_sha[:12]}"
-    elif pending_for_head:
+    elif current:
         if human_override and human_override.strip():
             approval_source = f"human-override:{human_override.strip()}"
         else:
-            blockers.append(f"Pending independent verifier(s) on {head_sha[:12]}: {', '.join(pending_for_head)}.")
+            blockers.append(f"Commit {head_sha[:12]} carries an active '{current['outcome']}' verdict.")
     elif old_base and old_head:
+        old_base_lc = old_base.strip().lower()
         old_head_lc = old_head.strip().lower()
-        old_verdicts: dict[str, Any] = verdicts_map.get(old_head_lc) or {}
-        old_dual = bool((state.get("dual_required_by_sha") or {}).get(old_head_lc, False))
-        old_approved = bool(old_verdicts) and all(v.get("verdict") == "approve" for v in old_verdicts.values())
-        if old_dual:
-            old_approved = old_approved and ("codex" in old_verdicts and "agy" in old_verdicts)
-        if not old_approved:
+        old_round = latest_for(old_head_lc)
+        if old_round.get("outcome") != "approve":
             raise KeelError(f"--old-head {old_head_lc[:12]} does not carry complete 'approve' verification for '{branch}'.")
         rebase_proof = (
             precomputed_rebase_proof
             if precomputed_rebase_proof is not None
-            else compare_rebase(project, old_base.strip().lower(), old_head_lc, base_tip_sha, head_sha)
+            else compare_rebase(project, old_base_lc, old_head_lc, base_tip_sha, head_sha)
         )
-        old_checks = checks_map.get(old_head_lc) or {}
-        if old_checks.get("configured") and not old_checks.get("skipped") and not checks_for_head.get("configured"):
+        if not _round_matches_scope(old_round, expected_merge_base=old_base_lc):
             blockers.append(
-                f"Pure rebase from {old_head_lc[:12]} requires re-running deterministic checks on {head_sha[:12]} "
-                "(pass --check '<cmd>' or --skip-checks '<reason>')."
+                f"Approval on {old_head_lc[:12]} does not match target base ({old_base_lc[:12]}) or "
+                f"revised task criteria ({task_file!r}); run fresh verification."
             )
-        else:
+        elif not missing_rebase_checks:
             approval_source = f"pure-rebase-from:{old_head_lc[:12]}"
     elif human_override and human_override.strip():
         approval_source = f"human-override:{human_override.strip()}"
@@ -1042,9 +959,7 @@ def evaluate_branch_gate(
         "ancestry_ok": ancestry_ok,
         "task_file": task_file,
         "checks": checks_for_head,
-        "verdicts": verdicts_for_head,
-        "pending_verifiers": pending_for_head,
-        "dual_required": dual_required,
+        "verdicts": current.get("verdicts", {}),
         "approval_source": approval_source,
         "rebase_proof": rebase_proof,
         "request_changes_rounds": rc_rounds,
@@ -1252,9 +1167,9 @@ def land_branch(
         raise KeelError("Cannot combine --execute and --discard.")
     if checks and skip_checks:
         raise KeelError("Cannot combine --check and --skip-checks.")
-    _validate_old_rebase_pair(old_base, old_head)
 
     project = primary_checkout_root(project)
+    _validate_old_rebase_pair(project, old_base, old_head)
     common_dir, _ = git_dirs(project)
     branch, slug = resolve_branch_and_slug(project, branch_or_slug, must_exist=True)
     default_branches = tuple(defaults.get("default_branches", ["main", "master"]))
@@ -1318,10 +1233,15 @@ def land_branch(
                     discard_commit_sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=project).stdout.strip().lower()
                     archived_task = archive_rel
 
-            with locked_branch_state(common_dir, branch) as state:
+            with edit_gate_state(common_dir, branch) as state:
                 state["branch"] = branch
                 state["discarded"] = True
                 state["discard_reason"] = clean_reason
+                if not keep_branch:
+                    state["rounds"] = []
+                    state["checks_by_sha"] = {}
+                    state["last_write"] = None
+                    state.pop("task_file", None)
 
             teardown = _remove_worktree_and_branch_after_land(
                 project, branch, base_ref=base_ref, keep_branch=keep_branch, discard=True
@@ -1339,22 +1259,12 @@ def land_branch(
 
     # 2. Optional deterministic checks run unlocked against `pinned_head_sha`, then merge into state under `flock`
     if checks:
-        chk_res = run_deterministic_checks(project, pinned_head_sha, checks)
-        with locked_branch_state(common_dir, branch) as state:
-            state.setdefault("checks_by_sha", {})[pinned_head_sha] = chk_res
+        _run_and_record_checks(project, common_dir, branch, pinned_head_sha, checks)
         _assert_pinned_refs(project, branch, base_ref, pinned_head_sha, pinned_base_tip_sha, require_clean_worktree=False)
     elif skip_checks is not None:
         if not skip_checks.strip():
             raise KeelError("--skip-checks requires a non-empty reason.")
-        with locked_branch_state(common_dir, branch) as state:
-            state.setdefault("checks_by_sha", {})[pinned_head_sha] = {
-                "configured": True,
-                "ok": True,
-                "skipped": True,
-                "skip_reason": skip_checks.strip(),
-                "commands": [],
-                "recorded_at": _now_iso(),
-            }
+        _record_skipped_checks(common_dir, branch, pinned_head_sha, skip_checks)
 
     max_review_rounds = int(defaults.get("max_review_rounds", 2))
     gate = evaluate_branch_gate(
@@ -1389,7 +1299,7 @@ def land_branch(
     archived_task = None
 
     with locked_repo_land(common_dir):
-        with locked_branch_state(common_dir, branch) as state:
+        with edit_gate_state(common_dir, branch) as state:
             _assert_pinned_refs(
                 project, branch, base_ref, pinned_head_sha, pinned_base_tip_sha, require_clean_worktree=True
             )
@@ -1471,6 +1381,11 @@ def land_branch(
             state["landed_head_sha"] = pinned_head_sha
             state["landed_sha"] = landed_sha
             state["landed_method"] = strategy
+            if not keep_branch:
+                state["rounds"] = []
+                state["checks_by_sha"] = {}
+                state["last_write"] = None
+                state.pop("task_file", None)
 
         teardown = _remove_worktree_and_branch_after_land(
             project,

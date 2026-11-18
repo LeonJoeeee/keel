@@ -7,10 +7,10 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any
 import unittest
 from unittest import mock
@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from keel_lib import KeelError  # noqa: E402
 from keel_lib.branch_gate import compare_rebase, validate_verdict_payload  # noqa: E402
+from keel_lib.executors.agy import AgyExecutor
+from keel_lib.executors.base import KeelConfigError
+from keel_lib.worktree import load_branch_state
 from keel_lib.executors.codex import CodexExecutor  # noqa: E402
 
 
@@ -79,7 +82,32 @@ def _init_repo_with_task(repo: Path, slug: str = "alpha") -> tuple[str, str]:
     return _git(repo, "rev-parse", "HEAD"), f"docs/tasks/active/20261117-{slug}.md"
 
 
+def _create_feature_worktree(repo: Path) -> Path:
+    _init_repo_with_task(repo)
+    wt = Path(_run_cli(["worktree", "create", "feature", "--project", str(repo)])["path"])
+    (wt / "calc.py").write_text("value = 7\n")
+    _git(wt, "commit", "-am", "Update value")
+    return wt
+
+
+def verifier(outcome="approve"):
+    def execute(adapter, req, defaults):
+        payload = {"verdict": outcome, "summary": "Checked", "blocking": [], "notes": [], "commands_run": []}
+        if outcome == "request_changes":
+            payload["blocking"] = ["Fix the implementation"]
+        req.output_path.write_text(json.dumps(payload))
+        return {"status": "completed", "executor": adapter.name, "level": req.level, "model": "test-model"}
+    return execute
+
+
 class BranchGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # A routing regression must never fall through to a real vendor process.
+        for adapter in ("agy", "codex"):
+            self.enterContext(mock.patch(
+                f"keel_lib.executors.{adapter}.run_process_group", side_effect=AssertionError("unexpected CLI launch"),
+            ))
+
     def test_verdict_schema_strictness(self) -> None:
         with self.assertRaises(KeelError):
             validate_verdict_payload(
@@ -132,7 +160,6 @@ class BranchGateTests(unittest.TestCase):
             )
             _git(wt_path, "add", ".")
             _git(wt_path, "commit", "-m", "feat(calc): add mul\n\nCo-authored-by: Helper <h@example.com>")
-            head_sha = _git(wt_path, "rev-parse", "HEAD")
 
             # Repo-wide `keel branch status` overview
             overview = _run_cli(["branch", "status", "--project", str(repo)])
@@ -140,19 +167,6 @@ class BranchGateTests(unittest.TestCase):
             self.assertEqual(overview["active_tasks_on_base"], ["docs/tasks/active/20261117-mul.md"])
             self.assertEqual(len(overview["worktrees"]), 1)
             self.assertFalse(overview["worktrees"][0]["gate"]["ready_to_land"])
-
-            # Failing deterministic `--check` aborts BEFORE invoking LLM verifier!
-            codex_called = False
-
-            def fake_codex_never(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
-                nonlocal codex_called
-                codex_called = True
-                return {}
-
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_never):
-                with self.assertRaisesRegex(KeelError, "Deterministic check failed"):
-                    _run_cli(["branch", "verify", "mul", "--project", str(repo), "--check", "exit 1"])
-            self.assertFalse(codex_called)
 
             # `--dual` verification: round 1 where BOTH `codex` and `agy` return `request_changes` -> counts as 1 round!
             captured_briefs: list[str] = []
@@ -171,9 +185,10 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_rc):
+            with (mock.patch.object(CodexExecutor, "execute", fake_codex_rc),
+                  mock.patch.object(AgyExecutor, "execute", verifier("request_changes"))):
                 dual_r1 = _run_cli(
                     [
                         "branch",
@@ -190,42 +205,8 @@ class BranchGateTests(unittest.TestCase):
             # Verify `main`'s IMMUTABLE locked spec ("calc.py only.") was injected into the verifier's brief!
             self.assertIn("calc.py only.", captured_briefs[0])
             self.assertEqual(dual_r1["request_changes_rounds"], 1)
-            agy_desc = dual_r1["verifiers"]["agy"]
-            agy_scratch = Path(agy_desc["scratch_root"])
-            self.assertTrue(agy_scratch.is_dir())
-            agy_verdict_file = Path(agy_desc["verdict_path"])
-            agy_verdict_file.write_text(
-                json.dumps(
-                    {
-                        "verdict": "request_changes",
-                        "summary": "Bounds modified.",
-                        "blocking": ["Restore Bounds section."],
-                        "notes": [],
-                        "commands_run": ["git diff"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            rec_r1 = _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "mul",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(agy_verdict_file),
-                    "--head-sha",
-                    head_sha,
-                    "--executor",
-                    "agy",
-                    "--cleanup-scratch",
-                    str(agy_scratch),
-                ]
-            )
-            # Dual pass on same SHA still counts as 1 round (NOT 2), and scratch clone was cleaned up!
-            self.assertEqual(rec_r1["request_changes_rounds"], 1)
-            self.assertFalse(agy_scratch.exists())
+            self.assertEqual(set(dual_r1["verifiers"]), {"agy", "codex"})
+            self.assertFalse(_run_cli(["branch", "status", "mul", "--project", str(repo)])["ready_to_land"])
 
             # Author fixes the defect on a new commit
             (wt_path / "docs/tasks/active/20261117-mul.md").write_text(
@@ -249,9 +230,10 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_approve):
+            with (mock.patch.object(CodexExecutor, "execute", fake_codex_approve),
+                  mock.patch.object(AgyExecutor, "execute", verifier())):
                 dual_r2 = _run_cli(
                     [
                         "branch",
@@ -265,42 +247,7 @@ class BranchGateTests(unittest.TestCase):
                     ]
                 )
 
-            # With only `codex` approved so far in `--dual`, branch MUST NOT be ready to land yet!
-            st_half = _run_cli(["branch", "status", "mul", "--project", str(repo)])
-            self.assertFalse(st_half["ready_to_land"])
-            self.assertTrue(st_half["dual_required"])
-
-            # Now `agy` also approves via `record-verdict`
-            agy_desc_2 = dual_r2["verifiers"]["agy"]
-            Path(agy_desc_2["verdict_path"]).write_text(
-                json.dumps(
-                    {
-                        "verdict": "approve",
-                        "summary": "Approved independently.",
-                        "blocking": [],
-                        "notes": [],
-                        "commands_run": ["python3 -c 'import calc'"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "mul",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    agy_desc_2["verdict_path"],
-                    "--head-sha",
-                    head_sha_2,
-                    "--executor",
-                    "agy",
-                    "--cleanup-scratch",
-                    agy_desc_2["scratch_root"],
-                ]
-            )
+            self.assertEqual(dual_r2["outcome"], "approve")
 
             # Dry-run `keel branch land` reports `ready_to_land: True` without mutating `main`
             dry = _run_cli(["branch", "land", "mul", "--project", str(repo)])
@@ -334,6 +281,69 @@ class BranchGateTests(unittest.TestCase):
             self.assertTrue((repo / "docs/tasks/archive/20261117-mul.md").is_file())
             self.assertIn("Co-authored-by: Helper <h@example.com>", _git(repo, "log", "-1", "--format=%B"))
 
+    def test_partial_check_reruns_preserve_requirements_across_rebase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            wt = _create_feature_worktree(repo)
+            args = ["feature", "--project", str(repo)]
+            first, second = "test -f calc.py", "test -f AGENTS.md"
+            old_base = _git(repo, "rev-parse", "main")
+            old_head = _git(wt, "rev-parse", "HEAD")
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli(["branch", "verify", *args, "--check", first, "--check", second])
+                _run_cli(["branch", "verify", *args, "--check", first])
+            status = _run_cli(["branch", "status", *args])
+            self.assertCountEqual([c["command"] for c in status["checks"]["commands"]], [first, second])
+            gate = _run_cli(["branch", "land", *args, "--check", second])
+            self.assertTrue(gate["ready_to_land"])
+            self.assertCountEqual([c["command"] for c in gate["checks"]["commands"]], [first, second])
+
+            (repo / "README.md").write_text("New base\n")
+            _git(repo, "add", "README.md")
+            _git(repo, "commit", "-m", "Document project")
+            _git(wt, "rebase", "main")
+            land = ["branch", "land", *args, "--old-base", old_base, "--old-head", old_head]
+            partial = _run_cli([*land, "--check", second])
+            self.assertFalse(partial["ready_to_land"])
+            self.assertIn(first, " ".join(partial["blockers"]))
+            complete = _run_cli([*land, "--check", first])
+            self.assertTrue(complete["ready_to_land"], complete["blockers"])
+            self.assertCountEqual([c["command"] for c in complete["checks"]["commands"]], [first, second])
+
+    def test_partial_rerun_cannot_clear_a_failed_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_feature_worktree(repo)
+            args = ["feature", "--project", str(repo)]
+            verify = ["branch", "verify", *args]
+            land = ["branch", "land", *args]
+            check = 'test "$KEEL_TEST_RESULT" = pass'
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli(verify)
+            with (mock.patch.dict(os.environ, {"KEEL_TEST_RESULT": "fail"}),
+                  mock.patch.object(CodexExecutor, "execute", side_effect=AssertionError("unexpected review"))):
+                with self.assertRaisesRegex(KeelError, "Deterministic check failed"):
+                    _run_cli([*verify, "--check", check, "--check", "test -f calc.py"])
+                with self.assertRaisesRegex(KeelError, "Deterministic check failed"):
+                    _run_cli([*verify, "--check", "true"])
+            gate = _run_cli([*land, "--check", "true"])
+            self.assertFalse(gate["ready_to_land"])
+            self.assertIn(check, " ".join(gate["blockers"]))
+            self.assertFalse(gate["checks"]["ok"])
+            self.assertEqual({c["command"]: c["ok"] for c in gate["checks"]["commands"]},
+                             {check: False, "test -f calc.py": False, "true": True})
+            with mock.patch.dict(os.environ, {"KEEL_TEST_RESULT": "pass"}):
+                partial = _run_cli([*land, "--check", check])
+            # The fail-fast batch never ran its second required command.
+            self.assertFalse(partial["checks"]["ok"])
+            fixed = _run_cli([*land, "--check", "test -f calc.py"])
+            self.assertTrue(fixed["ready_to_land"], fixed["blockers"])
+            self.assertTrue(fixed["checks"]["ok"])
+            self.assertCountEqual([c["command"] for c in fixed["checks"]["commands"]], [check, "test -f calc.py", "true"])
+            skipped = _run_cli([*land, "--skip-checks", "Owner accepted"])
+            self.assertTrue(skipped["checks"]["skipped"])
+            self.assertEqual(skipped["checks"]["skip_reason"], "Owner accepted")
+
     def test_two_round_circuit_breaker_and_pure_rebase_mandatory_check_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -357,7 +367,7 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_rc):
                 _run_cli(["branch", "verify", "sub", "--project", str(repo)])
@@ -389,7 +399,7 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_ok):
                 _run_cli(
@@ -404,6 +414,8 @@ class BranchGateTests(unittest.TestCase):
                         "python3 -c 'import calc; assert calc.sub(5, 2) == 3'",
                     ]
                 )
+
+            self.assertTrue(_run_cli(["branch", "land", "sub", "--project", str(repo)])["ready_to_land"])
 
             # Advance `main` with an unrelated file and rebase `task/sub` onto `main`
             (repo / "README.md").write_text("# Repo\n", encoding="utf-8")
@@ -445,35 +457,16 @@ class BranchGateTests(unittest.TestCase):
             self.assertFalse(dry_missing_chk["ready_to_land"])
             self.assertTrue(any("requires re-running deterministic checks" in b for b in dry_missing_chk["blockers"]))
 
+            for args in (["--skip-checks", "other checks passed"], ["--check", "true"]):
+                with self.subTest(args=args):
+                    gate = _run_cli(["branch", "land", "sub", "--project", str(repo), "--old-base", old_base,
+                                     "--old-head", old_head, *args])
+                    self.assertFalse(gate["ready_to_land"])
+                    self.assertTrue(any("requires re-running" in reason for reason in gate["blockers"]))
+
             # Current-head `request_changes` MUST strictly block landing even when `--old-base`/`--old-head` was approved!
-            rej_file = Path(tmp) / "rej_new_head.json"
-            rej_file.write_text(
-                json.dumps(
-                    {
-                        "verdict": "request_changes",
-                        "summary": "Rebased head broke runtime interaction.",
-                        "blocking": ["Fix interaction on rebased head."],
-                        "notes": [],
-                        "commands_run": ["pytest"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "sub",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(rej_file),
-                    "--head-sha",
-                    new_head,
-                    "--executor",
-                    "codex",
-                ]
-            )
+            with mock.patch.object(CodexExecutor, "execute", fake_rc):
+                _run_cli(["branch", "verify", "sub", "--project", str(repo), "--force-round"])
             rej_gate = _run_cli(
                 [
                     "branch",
@@ -665,213 +658,188 @@ class BranchGateTests(unittest.TestCase):
             (wt_custom / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b + 0\n", encoding="utf-8")
             _git(wt_custom, "add", "calc.py")
             _git(wt_custom, "commit", "-m", "fix: custom branch")
-            custom_sha = _git(wt_custom, "rev-parse", "HEAD")
-
-            v_file = Path(tmp) / "custom_ok.json"
-            v_file.write_text(
-                json.dumps(
-                    {
-                        "verdict": "approve",
-                        "summary": "ok",
-                        "blocking": [],
-                        "notes": [],
-                        "commands_run": ["git diff"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "feat/my-fix",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(v_file),
-                    "--head-sha",
-                    custom_sha,
-                    "--executor",
-                    "agy",
-                ]
-            )
+            with mock.patch.object(AgyExecutor, "execute", verifier()):
+                _run_cli(["branch", "verify", "feat/my-fix", "--executor", "agy", "--project", str(repo)])
             landed_custom = _run_cli(["branch", "land", "feat/my-fix", "--project", str(repo), "--execute"])
             self.assertTrue(landed_custom["landed"])
             self.assertFalse(wt_custom.exists())
             self.assertEqual(landed_custom["deleted_branch"], "feat/my-fix")
 
-    def test_concurrent_flock_state_safety_pending_hygiene_and_parallel_dual(self) -> None:
+    def test_split_dual_verdict_blocks_landing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _create_feature_worktree(repo)
+            args = ["feature", "--project", str(repo)]
+            for codex, agy in (("approve", "request_changes"), ("request_changes", "approve")):
+                with (self.subTest(codex=codex, agy=agy),
+                      mock.patch.object(CodexExecutor, "execute", verifier(codex)),
+                      mock.patch.object(AgyExecutor, "execute", verifier(agy))):
+                    result = _run_cli(["branch", "verify", *args, "--dual"])
+                    self.assertEqual(result["outcome"], "request_changes")
+                    gate = _run_cli(["branch", "land", *args])
+                    self.assertEqual({k: v["verdict"] for k, v in gate["verdicts"].items()},
+                                     {"codex": codex, "agy": agy})
+                    self.assertFalse(gate["ready_to_land"])
+
+    def test_dual_workers_overlap_and_failed_round_preserves_state(self) -> None:
+        import keel_lib.branch_gate as bg
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "space repo"
+            head, _ = _init_repo_with_task(repo)
+            _git(repo, "branch", "task/parallel")
+            barrier = threading.Barrier(2, timeout=5)
+            checkouts = {}
+            invalid = False
+
+            def check(adapter, req, defaults):
+                checkouts[adapter.name] = req.workdir
+                self.assertEqual(_git(req.workdir, "rev-parse", "HEAD"), head)
+                self.assertEqual(_git(req.workdir, "remote"), "")
+                self.assertTrue(req.scratch_verify)
+                self.assertEqual(req.level, "L3")
+                barrier.wait()
+                result = verifier()(adapter, req, defaults)
+                if invalid and adapter.name == "agy":
+                    req.output_path.write_text("{}")
+                return result
+
+            with (mock.patch.object(CodexExecutor, "execute", check),
+                  mock.patch.object(AgyExecutor, "execute", check)):
+                args = dict(project=repo, branch_or_slug="parallel", defaults=KEEL_CLI.load_defaults(), dual=True)
+                for key in ("executor", "model", "effort"):
+                    with self.subTest(key=key), self.assertRaises(KeelConfigError):
+                        bg.verify_branch(**args, **{key: "codex"})
+                result = bg.verify_branch(**args)
+                self.assertEqual(result["outcome"], "approve")
+                self.assertNotEqual(checkouts["agy"], checkouts["codex"])
+                self.assertFalse(any(path.parent.exists() for path in checkouts.values()))
+                before = load_branch_state(repo / ".git", "task/parallel")["rounds"]
+                self.assertEqual(len(before), 1)
+                self.assertEqual(set(before[0]["verdicts"]), {"agy", "codex"})
+                retained = Path(tmp) / "evidence"
+                bg.verify_branch(**args, output_dir=str(retained))
+                for name in ("codex", "agy"):
+                    self.assertTrue((retained / name / "checkout").is_dir())
+                    self.assertEqual(json.loads((retained / name / "verdict.json").read_text())["verdict"], "approve")
+                before = load_branch_state(repo / ".git", "task/parallel")["rounds"]
+                invalid = True
+                with self.assertRaisesRegex(KeelError, "required properties"):
+                    bg.verify_branch(**args)
+                self.assertEqual(load_branch_state(repo / ".git", "task/parallel")["rounds"], before)
+                self.assertFalse(any(path.parent.exists() for path in checkouts.values()))
+
+    def test_flat_ledger_retains_legacy_review_evidence(self) -> None:
+        from keel_lib.worktree import save_branch_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            head, _ = _init_repo_with_task(repo)
+            _git(repo, "branch", "topic")
+            detail = {"verdict": "approve", "summary": "Original review", "blocking": [],
+                      "notes": ["Original note"], "commands_run": ["git diff"]}
+            save_branch_state(repo / ".git", "topic", {
+                "branch": "topic", "checks_by_sha": {}, "verdicts_by_sha": {head: {"agy": detail}},
+                "rounds": [{"head_sha": head, "outcome": "approve", "dual": False, "verdicts": {"agy": "approve"}}],
+            })
+            status = _run_cli(["branch", "status", "topic", "--project", str(repo)])
+            self.assertEqual(status["verdicts"]["agy"], detail)
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli(["branch", "verify", "topic", "--project", str(repo)])
+            saved = load_branch_state(repo / ".git", "topic")
+            self.assertEqual(saved["rounds"][0]["verdicts"]["agy"], detail)
+            self.assertNotIn("verdicts_by_sha", saved)
+
+    def test_new_verdict_during_land_checks_is_preserved(self) -> None:
         import keel_lib.branch_gate as bg
 
         with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "project with spaces"
-            _init_repo_with_task(repo, slug="para")
-            wt_path = Path(_run_cli(["worktree", "create", "para", "--project", str(repo)])["path"])
-            (wt_path / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b\n# v2\n", encoding="utf-8")
-            _git(wt_path, "add", "calc.py")
-            _git(wt_path, "commit", "-m", "feat: v2")
-            sha1 = _git(wt_path, "rev-parse", "HEAD")
+            repo = Path(tmp)
+            _init_repo_with_task(repo)
+            wt = Path(_run_cli(["worktree", "create", "quick", "--project", str(repo)])["path"])
+            (wt / "calc.py").write_text("value = 7\n")
+            _git(wt, "commit", "-am", "Update value")
+            verify = ["branch", "verify", "quick", "--project", str(repo)]
+            land = ["branch", "land", "quick", "--project", str(repo), "--execute"]
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli(verify)
+            real_checks = bg.run_deterministic_checks
 
-            # 1. Failed `agy` setup (e.g. invalid model) MUST NOT leave `"agy"` in `pending_verifiers`!
-            with self.assertRaises(KeelError):
-                _run_cli(["branch", "verify", "para", "--project", str(repo), "--executor", "agy", "--model", "bad-model"])
-            st_clean = _run_cli(["branch", "status", "para", "--project", str(repo)])
-            self.assertEqual(st_clean["pending_verifiers"], [])
+            def checks(project, sha, commands):
+                result = real_checks(project, sha, commands)
+                _run_cli(verify)
+                return result
 
-            # 2. True parallel `--dual --executor agy` + `--dual --executor codex` joining the SAME dual round!
-            agy_prep = _run_cli(["branch", "verify", "para", "--project", str(repo), "--dual", "--executor", "agy"])
-            self.assertTrue(agy_prep["dual"])
-            # `record_verdict_command` properly shell-quotes `project with spaces`
-            import shlex
-
-            self.assertIn(shlex.quote(str(repo)), agy_prep["record_verdict_command"])
-            parsed_cmd = shlex.split(agy_prep["record_verdict_command"])
-            self.assertEqual(parsed_cmd[parsed_cmd.index("--project") + 1], str(repo))
-            agy_scratch = Path(agy_prep["scratch_root"])
-            agy_vpath = Path(agy_prep["verdict_path"])
-
-            # Simulate `agy` recording `"request_changes"` CONCURRENTLY *while* `codex` `--dual --executor codex` is running!
-            def fake_codex_concurrent_rc(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
-                agy_vpath.write_text(
-                    json.dumps(
-                        {
-                            "verdict": "request_changes",
-                            "summary": "AGY found defect mid-flight",
-                            "blocking": ["Fix edge case"],
-                            "notes": [],
-                            "commands_run": ["pytest"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                _run_cli(
-                    [
-                        "branch",
-                        "record-verdict",
-                        "para",
-                        "--project",
-                        str(repo),
-                        "--verdict-file",
-                        str(agy_vpath),
-                        "--head-sha",
-                        sha1,
-                        "--executor",
-                        "agy",
-                        "--cleanup-scratch",
-                        str(agy_scratch),
-                    ]
-                )
-                req.output_path.write_text(
-                    json.dumps(
-                        {
-                            "verdict": "request_changes",
-                            "summary": "Codex also found defect",
-                            "blocking": ["Fix edge case"],
-                            "notes": [],
-                            "commands_run": ["pytest"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
-
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_concurrent_rc):
-                codex_dual = _run_cli(
-                    ["branch", "verify", "para", "--project", str(repo), "--dual", "--executor", "codex"]
-                )
-
-            # Both verdicts preserved (neither clobbered!) AND joined 1 single dual round (`request_changes_rounds == 1`)!
-            st_after_para = _run_cli(["branch", "status", "para", "--project", str(repo)])
-            self.assertEqual(set(st_after_para["verdicts"].keys()), {"agy", "codex"})
-            self.assertEqual(codex_dual["request_changes_rounds"], 1)
-            self.assertEqual(st_after_para["request_changes_rounds"], 1)
-            self.assertEqual(st_after_para["pending_verifiers"], [])
-
-            # 3. Switching from `--dual` to single `--executor codex` clears stale `pending_verifiers` and `dual_required`!
-            (wt_path / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b\n# v3\n", encoding="utf-8")
-            _git(wt_path, "add", "calc.py")
-            _git(wt_path, "commit", "-m", "feat: v3")
-            sha2 = _git(wt_path, "rev-parse", "HEAD")
-
-            stale_prep = _run_cli(["branch", "verify", "para", "--project", str(repo), "--dual", "--executor", "agy"])
-            shutil.rmtree(stale_prep["scratch_root"], ignore_errors=True)
-            self.assertEqual(_run_cli(["branch", "status", "para", "--project", str(repo)])["pending_verifiers"], ["agy"])
-
-            def fake_codex_ok(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
-                req.output_path.write_text(
-                    json.dumps(
-                        {
-                            "verdict": "approve",
-                            "summary": "Single codex approved",
-                            "blocking": [],
-                            "notes": [],
-                            "commands_run": ["pytest"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
-
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_ok):
-                _run_cli(["branch", "verify", "para", "--project", str(repo), "--executor", "codex"])
-
-            st_single = _run_cli(["branch", "status", "para", "--project", str(repo)])
-            self.assertFalse(st_single["dual_required"])
-            self.assertEqual(st_single["pending_verifiers"], [])
-            self.assertTrue(st_single["ready_to_land"])
-
-            # 4. Concurrent `record-verdict` (`request_changes`) arriving *while* `land --check` runs `run_deterministic_checks`
-            # MUST NOT be overwritten by `land_branch`'s check-state update, and MUST block `--execute`!
-            orig_run_checks = bg.run_deterministic_checks
-
-            def hooked_checks(proj_arg: Path, head_arg: str, cmds: Any) -> dict[str, Any]:
-                res_chk = orig_run_checks(proj_arg, head_arg, cmds)
-                late_rej = Path(tmp) / "late_rej.json"
-                late_rej.write_text(
-                    json.dumps(
-                        {
-                            "verdict": "request_changes",
-                            "summary": "Late verifier caught race bug",
-                            "blocking": ["Race bug"],
-                            "notes": [],
-                            "commands_run": ["pytest"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                _run_cli(
-                    [
-                        "branch",
-                        "record-verdict",
-                        "para",
-                        "--project",
-                        str(repo),
-                        "--verdict-file",
-                        str(late_rej),
-                        "--head-sha",
-                        sha2,
-                        "--executor",
-                        "agy",
-                    ]
-                )
-                return res_chk
-
-            with mock.patch.object(bg, "run_deterministic_checks", hooked_checks):
+            with (mock.patch.object(CodexExecutor, "execute", verifier("request_changes")),
+                  mock.patch.object(bg, "run_deterministic_checks", checks)):
                 with self.assertRaisesRegex(KeelError, "request_changes"):
-                    _run_cli(
-                        [
-                            "branch",
-                            "land",
-                            "para",
-                            "--project",
-                            str(repo),
-                            "--check",
-                            "python3 -c 'import calc'",
-                            "--execute",
-                        ]
-                    )
+                    _run_cli([*land, "--check", "true"])
+                _run_cli(verify)
+                with self.assertRaisesRegex(KeelError, "convergence cap"):
+                    _run_cli(verify)
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli([*verify, "--force-round"])
+            landed = _run_cli(land)
+            self.assertTrue(landed["landed"])
+            self.assertIsNone(landed["archived_task"])
+            self.assertFalse(wt.exists())
 
-    def test_round2_pinned_sha_idempotent_verdict_dual_cap_join_custom_base_and_utf8_tasks(self) -> None:
+    def test_write_routing_review_inheritance_and_rework_on_run_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init_repo_with_task(repo)
+            wt = Path(_run_cli(["worktree", "create", "alpha", "--project", str(repo)])["path"])
+            project = ["--project", str(repo)]
+            run = ["agent", "run", *project, "--cwd", str(wt), "--why", "Test", "--task", "Implement",
+                   "--mode", "write", "--run-id", "writer"]
+            resume = ["agent", "resume", "writer", *project, "--message", "Rework"]
+            verify = ["branch", "verify", "alpha", *project]
+            def state():
+                return load_branch_state(repo / ".git", "task/alpha")
+
+            outcome = "approve"
+
+            def execute(adapter, req, defaults):
+                if req.preset == "verify":
+                    return verifier(outcome)(adapter, req, defaults)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+            def continue_write(adapter, run_dir, record, instruction, output, defaults, **kwargs):
+                return {"status": "completed", "level": kwargs["level"] or record["level"]}
+
+            with (mock.patch.object(AgyExecutor, "execute", execute), mock.patch.object(CodexExecutor, "execute", execute),
+                  mock.patch.object(AgyExecutor, "resume", continue_write)):
+                manual = _run_cli(verify)
+                self.assertEqual((manual["executor"], manual["level"]), ("codex", "L3"))
+                for writer, tier, reviewer, expected in (
+                    ("agy", "L1", "codex", "L2"), ("codex", "L3", "agy", "L3"), ("agy", "L2", "codex", "L2"),
+                ):
+                    _run_cli([*run, "--executor", writer, "--level", tier])
+                    review = _run_cli(verify)
+                    self.assertEqual((review["executor"], review["level"]), (reviewer, expected))
+                    self.assertEqual(state()["rounds"][-1]["implement_level"], tier)
+                    with self.assertRaisesRegex(KeelError, "level"):
+                        _run_cli([*verify, "--level", "L1" if tier != "L3" else "L2"])
+                outcome = "request_changes"
+                _run_cli([*verify, "--level", "L4"])
+                for cmd in (run, resume):
+                    with self.assertRaisesRegex(KeelError, "L3"):
+                        _run_cli([*cmd, "--level", "L2"])
+                previous_write = state()["last_write"]
+                with mock.patch.object(AgyExecutor, "resume", side_effect=KeelError("executor failed")):
+                    with self.assertRaisesRegex(KeelError, "executor failed"):
+                        _run_cli([*resume, "--level", "L4"])
+                self.assertEqual(state()["last_write"], previous_write)
+                _run_cli([*resume, "--level", "L3"])
+                _run_cli([*run, "--level", "L3"])
+                self.assertEqual(state()["last_write"]["level"], "L3")
+                _run_cli(verify)
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli(resume)
+                _run_cli([*resume, "--level", "L4"])
+                self.assertEqual(state()["last_write"]["level"], "L4")
+                for obsolete in ("pending_verifiers", "dual_required_by_sha", "verdicts_by_sha", "request_changes_rounds"):
+                    self.assertNotIn(obsolete, state())
+
+    def test_pinned_sha_custom_base_and_utf8_tasks(self) -> None:
         import keel_lib.branch_gate as bg
         from keel_lib.guard_rules import evaluate_command
 
@@ -928,7 +896,7 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_codex_utf8):
                 v_utf8 = _run_cli(["branch", "verify", "mul", "--project", str(repo)])
@@ -1005,133 +973,6 @@ class BranchGateTests(unittest.TestCase):
             self.assertTrue(wt_race.is_dir())
             self.assertEqual(_git(wt_race, "rev-parse", "HEAD"), h2_sha_holder[0])
 
-            # C. Idempotent `record-verdict` + joining an open incomplete Round-2 `--dual` round at the cap!
-            wt_idem = Path(_run_cli(["worktree", "create", "idem", "--project", str(repo)])["path"])
-            (wt_idem / "calc.py").write_text("# idem r1\n", encoding="utf-8")
-            _git(wt_idem, "add", "calc.py")
-            _git(wt_idem, "commit", "-m", "feat: r1")
-            idem_sha1 = _git(wt_idem, "rev-parse", "HEAD")
-
-            agy_r1 = _run_cli(["branch", "verify", "idem", "--project", str(repo), "--executor", "agy"])
-            rc_file = Path(tmp) / "idem_rc.json"
-            rc_file.write_text(
-                json.dumps(
-                    {
-                        "verdict": "request_changes",
-                        "summary": "Round 1 defect",
-                        "blocking": ["Fix r1"],
-                        "notes": [],
-                        "commands_run": ["git diff"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            # Recording the EXACT same `(idem_sha1, agy)` verdict TWICE keeps `request_changes_rounds == 1`!
-            for _ in range(2):
-                rec_idem = _run_cli(
-                    [
-                        "branch",
-                        "record-verdict",
-                        "idem",
-                        "--project",
-                        str(repo),
-                        "--verdict-file",
-                        str(rc_file),
-                        "--head-sha",
-                        idem_sha1,
-                        "--executor",
-                        "agy",
-                        "--cleanup-scratch",
-                        agy_r1["scratch_root"],
-                    ]
-                )
-            self.assertEqual(rec_idem["request_changes_rounds"], 1)
-            ok_file = Path(tmp) / "idem_ok.json"
-            ok_file.write_text(
-                json.dumps(
-                    {
-                        "verdict": "approve",
-                        "summary": "Corrected in place",
-                        "blocking": [],
-                        "notes": [],
-                        "commands_run": ["git diff"],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            rec_flip_ok = _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "idem",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(ok_file),
-                    "--head-sha",
-                    idem_sha1,
-                    "--executor",
-                    "agy",
-                ]
-            )
-            self.assertEqual(rec_flip_ok["request_changes_rounds"], 0)
-            rec_flip_rc = _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "idem",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(rc_file),
-                    "--head-sha",
-                    idem_sha1,
-                    "--executor",
-                    "agy",
-                ]
-            )
-            self.assertEqual(rec_flip_rc["request_changes_rounds"], 1)
-
-            # Commit `idem_sha2` for Round 2 (`--dual`): `agy` rejects first (pushing `request_changes_rounds` to 2 == cap),
-            # then `codex` joins Round 2 WITHOUT `--force-round` and completes Round 2 cleanly!
-            (wt_idem / "calc.py").write_text("# idem r2\n", encoding="utf-8")
-            _git(wt_idem, "add", "calc.py")
-            _git(wt_idem, "commit", "-m", "feat: r2")
-            idem_sha2 = _git(wt_idem, "rev-parse", "HEAD")
-
-            agy_r2 = _run_cli(["branch", "verify", "idem", "--project", str(repo), "--dual", "--executor", "agy"])
-            rec_r2_agy = _run_cli(
-                [
-                    "branch",
-                    "record-verdict",
-                    "idem",
-                    "--project",
-                    str(repo),
-                    "--verdict-file",
-                    str(rc_file),
-                    "--head-sha",
-                    idem_sha2,
-                    "--executor",
-                    "agy",
-                    "--cleanup-scratch",
-                    agy_r2["scratch_root"],
-                ]
-            )
-            self.assertEqual(rec_r2_agy["request_changes_rounds"], 2)
-
-            def fake_codex_r2_rc(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
-                req.output_path.write_text(rc_file.read_text(encoding="utf-8"), encoding="utf-8")
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
-
-            with mock.patch.object(CodexExecutor, "execute", fake_codex_r2_rc):
-                codex_r2 = _run_cli(
-                    ["branch", "verify", "idem", "--project", str(repo), "--dual", "--executor", "codex"]
-                )
-            self.assertEqual(codex_r2["request_changes_rounds"], 2)
-            # Now that Round 2 IS complete, starting a brand-new Round 3 without `--force-round` IS blocked!
-            with self.assertRaisesRegex(KeelError, "convergence cap"):
-                _run_cli(["branch", "verify", "idem", "--project", str(repo), "--dual", "--executor", "agy"])
-
             # D. Landing onto custom `--base develop` when `main` also exists in the repository!
             _git(repo, "checkout", "-b", "develop", "main")
             main_tip = _git(repo, "rev-parse", "main")
@@ -1202,7 +1043,7 @@ class BranchGateTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return {"status": "completed", "executor": "codex", "model": "gpt-6-astra", "effort": "max"}
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_codex_approve):
                 v_link = _run_cli(["branch", "verify", "linked", "--project", str(wt_link)])
@@ -1214,7 +1055,7 @@ class BranchGateTests(unittest.TestCase):
             dirty_file.unlink()
 
             # 3. Full gate revalidation inside `land.lock` critical section: if a concurrent failed `checks_by_sha`
-            # or `pending_verifiers` entry arrives after initial `evaluate_branch_gate`, `land --execute` aborts!
+            # or rejecting round arrives after initial `evaluate_branch_gate`, `land --execute` aborts!
             common_dir, _ = git_dirs(repo)
             orig_extract = bg.extract_commit_trailers
 
@@ -1235,21 +1076,20 @@ class BranchGateTests(unittest.TestCase):
             self.assertEqual(_git(repo, "rev-parse", "main"), base_sha)
             self.assertTrue(wt_link.is_dir())
 
-            # Clear failed check and verify concurrent `pending_verifiers` ALSO aborts inside critical section!
+            # A completed rejection arriving after evaluation also blocks the merge.
             with locked_branch_state(common_dir, "task/linked") as st:
-                st["checks_by_sha"].pop(head_sha, None)
+                st["checks_by_sha"].pop(head_sha)
 
-            def inject_concurrent_pending(proj_arg: Path, rev_range: str) -> list[str]:
-                res_t = orig_extract(proj_arg, rev_range)
-                with locked_branch_state(common_dir, "task/linked") as st:
-                    st.setdefault("pending_verifiers", {})[head_sha] = ["agy"]
-                return res_t
+            def inject_review(project, rev_range):
+                with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                    _run_cli(["branch", "verify", "linked", "--project", str(repo)])
+                return orig_extract(project, rev_range)
 
-            with mock.patch.object(bg, "extract_commit_trailers", inject_concurrent_pending):
-                with self.assertRaisesRegex(KeelError, "Pending independent verifier"):
+            with mock.patch.object(bg, "extract_commit_trailers", inject_review):
+                with self.assertRaisesRegex(KeelError, "request_changes"):
                     _run_cli(["branch", "land", "linked", "--project", str(wt_link), "--execute"])
-            with locked_branch_state(common_dir, "task/linked") as st:
-                st["pending_verifiers"].pop(head_sha, None)
+            with mock.patch.object(CodexExecutor, "execute", verifier()):
+                _run_cli(["branch", "verify", "linked", "--project", str(repo)])
 
             # 4. Clean `land --project <wt_link> --execute` resolves `primary_root` (`repo`), acquires `land.lock`,
             # merges onto `main`, and removes `<wt_link>` cleanly!
@@ -1258,6 +1098,430 @@ class BranchGateTests(unittest.TestCase):
             self.assertFalse(wt_link.exists())
             self.assertTrue((common_dir / "keel-state" / "land.lock").is_file())
             self.assertEqual((repo / "app.py").read_text(encoding="utf-8"), "X = 2\n")
+
+    def test_skip_checks_preserves_rebase_rerun_and_failed_verify_retains_explicit_task_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            # Competing slug-matching task `20261117-worker-lane.md` MUST NOT override explicit `--task-file`!
+            _init_repo_with_task(repo, slug="worker-lane")
+            custom_task = repo / "docs" / "tasks" / "active" / "20261118-custom-spec.md"
+            custom_task.write_text("# Task: Custom\n\n## Bounds\n- LOCKED_CUSTOM_BOUND_TOKEN\n", encoding="utf-8")
+
+            wt_info = _run_cli(["worktree", "create", "worker-lane", "--project", str(repo)])
+            wt = Path(wt_info["path"])
+            (wt / "app.py").write_text("VALUE = 9\n", encoding="utf-8")
+            _git(wt, "add", "app.py")
+            _git(wt, "commit", "-m", "feat: initial draft")
+
+            # Uncommitted working-tree --task-file (exists on disk, not in Git) MUST be rejected!
+            with self.assertRaisesRegex(KeelError, "not committed"):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "worker-lane",
+                        "--project",
+                        str(repo),
+                        "--task-file",
+                        "docs/tasks/active/20261118-custom-spec.md",
+                    ]
+                )
+            _git(repo, "add", "docs/tasks/active/20261118-custom-spec.md")
+            _git(repo, "commit", "-m", "docs(tasks): open custom spec")
+            old_base = _git(repo, "rev-parse", "main")
+            _git(wt, "rebase", "main")
+
+            # Missing or directory --task-file rejected without poisoning branch state
+            for bad_task in ("docs/tasks/active/nonexistent.md", "docs/tasks/active"):
+                with self.assertRaisesRegex(KeelError, "not committed"):
+                    _run_cli(
+                        [
+                            "branch",
+                            "verify",
+                            "worker-lane",
+                            "--project",
+                            str(repo),
+                            "--task-file",
+                            bad_task,
+                        ]
+                    )
+
+            check_cmd = "grep -q 'VALUE = 10' app.py"
+
+            # First verify with explicit --task-file fails on --check, yet persists task_file association!
+            with self.assertRaisesRegex(KeelError, "Deterministic check failed"):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "worker-lane",
+                        "--project",
+                        str(repo),
+                        "--task-file",
+                        "docs/tasks/active/20261118-custom-spec.md",
+                        "--check",
+                        check_cmd,
+                    ]
+                )
+
+            # Author commits the fix on the branch and retries WITHOUT --task-file
+            (wt / "app.py").write_text("VALUE = 10\n", encoding="utf-8")
+            _git(wt, "add", "app.py")
+            _git(wt, "commit", "-m", "fix: set VALUE = 10")
+            old_head = _git(wt, "rev-parse", "HEAD")
+
+            captured_briefs: list[str] = []
+
+            def fake_codex(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                captured_briefs.append(req.brief_path.read_text(encoding="utf-8"))
+                req.output_path.write_text(
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "summary": "Approved",
+                            "blocking": [],
+                            "notes": [],
+                            "commands_run": ["true"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "high"}
+
+            # Retry WITHOUT --task-file retains custom task spec in brief and passes check_cmd
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                v_ok = _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "worker-lane",
+                        "--project",
+                        str(repo),
+                        "--check",
+                        check_cmd,
+                    ]
+                )
+            self.assertEqual(v_ok["task_file"], "docs/tasks/active/20261118-custom-spec.md")
+            self.assertIn("LOCKED_CUSTOM_BOUND_TOKEN", captured_briefs[0])
+
+            # Dry-run land with --skip-checks on old_head MUST NOT erase check_cmd from old_head's command history
+            skip_dry = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "worker-lane",
+                    "--project",
+                    str(repo),
+                    "--skip-checks",
+                    "Already passed on old_head",
+                ]
+            )
+            self.assertTrue(skip_dry["ready_to_land"])
+
+            # Advance `main` and pure-rebase `task/worker-lane`
+            (repo / "README.txt").write_text("main advance\n", encoding="utf-8")
+            _git(repo, "add", "README.txt")
+            _git(repo, "commit", "-m", "docs: readme")
+            _git(wt, "rebase", "main")
+
+            # Without rerunning check_cmd on the rebased SHA, land dry-run MUST block!
+            rebased_dry = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "worker-lane",
+                    "--project",
+                    str(repo),
+                    "--old-base",
+                    old_base,
+                    "--old-head",
+                    old_head,
+                ]
+            )
+            self.assertFalse(rebased_dry["ready_to_land"])
+            self.assertTrue(any(check_cmd in b for b in rebased_dry["blockers"]))
+
+            # Even if a fresh verify (without --check) approves the rebased SHA, passing --old-base/--old-head
+            # STILL enforces rerunning old_head's deterministic checks (and rejects abbreviated --old-head)!
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(["branch", "verify", "worker-lane", "--project", str(repo)])
+            with self.assertRaisesRegex(KeelError, "full 40/64-character commit SHA"):
+                _run_cli(
+                    [
+                        "branch",
+                        "land",
+                        "worker-lane",
+                        "--project",
+                        str(repo),
+                        "--old-base",
+                        old_base,
+                        "--old-head",
+                        old_head[:12],
+                    ]
+                )
+            rebased_after_verify = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "worker-lane",
+                    "--project",
+                    str(repo),
+                    "--old-base",
+                    old_base,
+                    "--old-head",
+                    old_head,
+                ]
+            )
+            self.assertFalse(rebased_after_verify["ready_to_land"])
+            self.assertTrue(any(check_cmd in b for b in rebased_after_verify["blockers"]))
+
+            # Switching --task-file to another task (`20261117-worker-lane.md`) and failing in the verifier
+            # MUST NOT allow landing that other task under `20261118-custom-spec.md`'s approval!
+            def fail_verifier(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                raise KeelError("simulated verifier outage")
+
+            with mock.patch.object(CodexExecutor, "execute", fail_verifier):
+                with self.assertRaisesRegex(KeelError, "simulated verifier outage"):
+                    _run_cli(
+                        [
+                            "branch",
+                            "verify",
+                            "worker-lane",
+                            "--project",
+                            str(repo),
+                            "--task-file",
+                            "docs/tasks/active/20261117-worker-lane.md",
+                        ]
+                    )
+            unverified_other = _run_cli(["branch", "land", "worker-lane", "--project", str(repo)])
+            self.assertEqual(unverified_other["task_file"], "docs/tasks/active/20261117-worker-lane.md")
+            self.assertFalse(unverified_other["ready_to_land"])
+
+            # Rerunning check_cmd with --task-file pointing back to the approved custom spec lands and archives it!
+            landed = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "worker-lane",
+                    "--project",
+                    str(repo),
+                    "--task-file",
+                    "docs/tasks/active/20261118-custom-spec.md",
+                    "--old-base",
+                    old_base,
+                    "--old-head",
+                    old_head,
+                    "--check",
+                    check_cmd,
+                    "--execute",
+                ]
+            )
+            self.assertTrue(landed["landed"])
+            self.assertEqual(landed["archived_task"], "docs/tasks/archive/20261118-custom-spec.md")
+
+            # Reusing the same branch slug `worker-lane` after squash-landing picks up the remaining/new active task
+            # (`20261117-worker-lane.md`) rather than the archived `20261118-custom-spec.md`!
+            wt2_info = _run_cli(["worktree", "create", "worker-lane", "--project", str(repo)])
+            wt2 = Path(wt2_info["path"])
+            (wt2 / "app.py").write_text("VALUE = 20\n", encoding="utf-8")
+            _git(wt2, "add", "app.py")
+            _git(wt2, "commit", "-m", "feat: second worker-lane slice")
+            sha2 = _git(wt2, "rev-parse", "HEAD")
+
+            captured_briefs.clear()
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                v_reused = _run_cli(["branch", "verify", "worker-lane", "--project", str(repo)])
+            self.assertEqual(v_reused["task_file"], "docs/tasks/active/20261117-worker-lane.md")
+            self.assertEqual(v_reused["request_changes_rounds"], 0)
+
+            # Open a second active task B (`20261118-other.md`) on `main` and rebase `worker-lane`
+            other_task = repo / "docs" / "tasks" / "active" / "20261118-other.md"
+            other_task.write_text("# Task: Other\n\n## Bounds\n- OTHER_TOKEN\n", encoding="utf-8")
+            _git(repo, "add", "docs/tasks/active/20261118-other.md")
+            _git(repo, "commit", "-m", "docs(tasks): open other spec")
+            _git(wt2, "rebase", "main")
+            sha3 = _git(wt2, "rev-parse", "HEAD")
+
+            # 1) Legacy pre-upgrade round lacking `"task_file"` retains its original `state["task_file"]` provenance
+            # even when a subsequent verify under `--task-file .../20261118-other.md` fails!
+            from keel_lib.worktree import save_branch_state
+
+            save_branch_state(
+                repo / ".git",
+                "task/worker-lane",
+                {
+                    "branch": "task/worker-lane",
+                    "task_file": "docs/tasks/active/20261117-worker-lane.md",
+                    "checks_by_sha": {},
+                    "rounds": [
+                        {
+                            "head_sha": sha3,
+                            "outcome": "approve",
+                            "dual": False,
+                            "verdicts": {
+                                "codex": {
+                                    "verdict": "approve",
+                                    "summary": "Legacy ok",
+                                    "blocking": [],
+                                    "notes": [],
+                                    "commands_run": ["true"],
+                                }
+                            },
+                        }
+                    ],
+                },
+            )
+            with mock.patch.object(CodexExecutor, "execute", fail_verifier):
+                with self.assertRaisesRegex(KeelError, "simulated verifier outage"):
+                    _run_cli(
+                        [
+                            "branch",
+                            "verify",
+                            "worker-lane",
+                            "--project",
+                            str(repo),
+                            "--task-file",
+                            "docs/tasks/active/20261118-other.md",
+                        ]
+                    )
+            legacy_switch_dry = _run_cli(["branch", "land", "worker-lane", "--project", str(repo)])
+            self.assertEqual(legacy_switch_dry["task_file"], "docs/tasks/active/20261118-other.md")
+            self.assertFalse(legacy_switch_dry["ready_to_land"])
+
+            # 2) A later `request_changes` round on the same SHA overrides an earlier `approve` round even if
+            # `--task-file` points back to the earlier round's task!
+            def fake_reject(self_obj: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                req.output_path.write_text(
+                    json.dumps(
+                        {
+                            "verdict": "request_changes",
+                            "summary": "Found bug",
+                            "blocking": ["Real regression"],
+                            "notes": [],
+                            "commands_run": ["pytest"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "high"}
+
+            with mock.patch.object(CodexExecutor, "execute", fake_reject):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "worker-lane",
+                        "--project",
+                        str(repo),
+                        "--task-file",
+                        "docs/tasks/active/20261118-other.md",
+                    ]
+                )
+            override_attempt = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "worker-lane",
+                    "--project",
+                    str(repo),
+                    "--task-file",
+                    "docs/tasks/active/20261117-worker-lane.md",
+                ]
+            )
+            self.assertFalse(override_attempt["ready_to_land"])
+            self.assertTrue(any("request_changes" in b for b in override_attempt["blockers"]))
+
+            # 3) Approving `narrow-topic` against `--base develop` MUST NOT authorize landing onto `--base main`
+            # when `main..develop` contains unreviewed changes (`merge_base_sha` mismatch)!
+            _git(repo, "checkout", "-b", "develop", "main")
+            (repo / "develop_only.txt").write_text("unreviewed\n", encoding="utf-8")
+            _git(repo, "add", "develop_only.txt")
+            _git(repo, "commit", "-m", "feat: develop only")
+            _git(repo, "checkout", "main")
+
+            wt_dev = Path(_run_cli(["worktree", "create", "narrow-topic", "--project", str(repo), "--base", "develop"])["path"])
+            (wt_dev / "topic.txt").write_text("reviewed\n", encoding="utf-8")
+            _git(wt_dev, "add", "topic.txt")
+            _git(wt_dev, "commit", "-m", "feat: topic")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(["branch", "verify", "narrow-topic", "--project", str(repo), "--base", "develop"])
+            dev_status = _run_cli(["branch", "status", "narrow-topic", "--project", str(repo), "--base", "develop"])
+            self.assertTrue(dev_status["ready_to_land"])
+            land_onto_main = _run_cli(["branch", "land", "narrow-topic", "--project", str(repo), "--base", "main"])
+            self.assertFalse(land_onto_main["ready_to_land"])
+            self.assertTrue(any("merge-base" in b for b in land_onto_main["blockers"]))
+
+            # 4) Task criteria blob binding (`task_blob_sha`):
+            # (a) Same merge-base (`fork_point`), but `release` loosened `docs/tasks/active/20261118-other.md` while
+            #     `main` has stricter bounds -> verifying `--base release` MUST NOT approve `--base main`!
+            fork_point = _git(repo, "rev-parse", "main")
+            _git(repo, "checkout", "-b", "release", fork_point)
+            (repo / "docs/tasks/active/20261118-other.md").write_text("# Task: Other\n\n## Bounds\n- LOOSE_BOUNDS\n", encoding="utf-8")
+            _git(repo, "add", "docs/tasks/active/20261118-other.md")
+            _git(repo, "commit", "-m", "docs(tasks): loosen on release")
+            _git(repo, "checkout", "main")
+
+            wt_math = Path(_run_cli(["worktree", "create", "math-lane", "--project", str(repo), "--base", "main"])["path"])
+            (wt_math / "probe.py").write_text("P = 1\n", encoding="utf-8")
+            _git(wt_math, "add", "probe.py")
+            _git(wt_math, "commit", "-m", "feat: probe")
+            math_old_head = _git(wt_math, "rev-parse", "HEAD")
+
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "math-lane",
+                        "--project",
+                        str(repo),
+                        "--base",
+                        "release",
+                        "--task-file",
+                        "docs/tasks/active/20261118-other.md",
+                    ]
+                )
+            # Notice `merge-base(release, math-lane) == fork_point == merge-base(main, math-lane)`,
+            # yet `task_blob_sha` differs between `release` and `main`!
+            cross_base_land = _run_cli(["branch", "land", "math-lane", "--project", str(repo), "--base", "main"])
+            self.assertFalse(cross_base_land["ready_to_land"])
+            self.assertTrue(any("task criteria" in b for b in cross_base_land["blockers"]))
+
+            # (b) Approve against `main`, then revise `docs/tasks/active/20261118-other.md` on `main` and pure-rebase:
+            #     rebase carry-over MUST block until fresh verification runs against the revised criteria!
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "math-lane",
+                        "--project",
+                        str(repo),
+                        "--base",
+                        "main",
+                        "--task-file",
+                        "docs/tasks/active/20261118-other.md",
+                    ]
+                )
+            (repo / "docs/tasks/active/20261118-other.md").write_text("# Task: Other\n\n## Bounds\n- REVISED_STRICT_BOUNDS\n", encoding="utf-8")
+            _git(repo, "add", "docs/tasks/active/20261118-other.md")
+            _git(repo, "commit", "-m", "docs(tasks): tighten bounds on main")
+            _git(wt_math, "rebase", "main")
+            revised_rebase_land = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "math-lane",
+                    "--project",
+                    str(repo),
+                    "--old-base",
+                    fork_point,
+                    "--old-head",
+                    math_old_head,
+                ]
+            )
+            self.assertFalse(revised_rebase_land["ready_to_land"])
+            self.assertTrue(any("revised task criteria" in b for b in revised_rebase_land["blockers"]))
 
 
 if __name__ == "__main__":

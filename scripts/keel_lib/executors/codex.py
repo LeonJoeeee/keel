@@ -184,8 +184,7 @@ class CodexExecutor(ExecutorAdapter):
         return argv
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
-        requested_level = "L3" if req.is_legacy_scratch_verify else req.level
-        level, model, effort = resolve_executor_level_config(self.name, requested_level, defaults)
+        level, model, effort = resolve_executor_level_config(self.name, req.level, defaults)
         if req.preset == "verify":
             enforce_verify_min_level(level, defaults)
         assert effort is not None  # Required by the Codex level mapping

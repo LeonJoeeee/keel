@@ -70,6 +70,11 @@ class DummyThirdSideExecutor(ExecutorAdapter):
 
 
 class WorktreeAndDispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(patch("keel_lib.executors.codex.discover_mcp_approval_flags", return_value=[]))
+        self.enterContext(patch("keel_lib.executors.agy.run_process_group",
+                                side_effect=AssertionError("unexpected agy launch")))
+
     def test_pure_git_worktree_remote_stripping_and_ancestry_or_squash_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "adopted"
@@ -221,6 +226,18 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             )
             codex.chmod(0o755)
 
+            agy = repo / "agy"
+            agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "if 'failing-model' in sys.argv:\n"
+                "    print(json.dumps({'status': 'ERROR', 'error': 'failed test run'}))\n"
+                "    sys.exit(4)\n"
+                "print(json.dumps({'conversation_id': 'test-session', 'status': 'SUCCESS', "
+                "'response': json.dumps(sys.argv[1:])}))\n"
+            )
+            agy.chmod(0o755)
+
             def cli(*args: str, status: int = 0) -> Any:
                 proc = subprocess.run(
                     [str(ROOT / "scripts" / "keel"), "agent", *args, "--project", str(repo)],
@@ -291,39 +308,99 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertEqual(set(record_path.parent.glob("followup-*.md")), followups)
 
             host = cli(*run, "--preset", "implement", "--level", "l1")
-            self.assertEqual((host["executor"], host["status"]), ("agy", "awaiting_host_invoke"))
-            original = record_path.read_bytes()
-            for flag, value in (("--level", "L3"), ("--model", "pro"), ("--effort", "high")):
-                with self.subTest(flag=flag):
-                    error = cli(*resume, flag, value, status=2)
-                    self.assertIn("Antigravity", error)
-                    self.assertIn(flag, error)
-                    self.assertEqual(record_path.read_bytes(), original)
-            continued = cli(*resume)
-            self.assertEqual((continued["level"], continued["status"]), ("L1", "awaiting_host_send_message"))
+            self.assertEqual((host["executor"], host["status"]), ("agy", "completed"))
+            continued = cli(*resume, "--level", "L3", "--model", "custom-model", "--effort", "high")
+            self.assertEqual((continued["level"], continued["model"], continued["effort"]),
+                             ("L3", "custom-model", "high"))
+            argv = json.loads(Path(continued["output_path"]).read_text())
+            self.assertEqual(argv[:2], ["--conversation", host["session_id"]])
+            self.assertIn("--add-dir", argv)
+            self.assertNotIn("--new-project", argv)
+            self.assertEqual(json.loads(Path(continued["result_path"]).read_text())["status"], "SUCCESS")
 
-    def test_agy_execute_preserves_host_descriptor_compatibility(self) -> None:
+            embedded = cli(*resume, "--model", "test-model-low")
+            argv = json.loads(Path(embedded["output_path"]).read_text())
+            self.assertNotIn("--effort", argv)
+            self.assertEqual(argv[argv.index("--model") + 1], "test-model-low")
+            original = record_path.read_bytes()
+            self.assertIn("conflicts", cli(*resume, "--effort", "high", status=2))
+            self.assertEqual(record_path.read_bytes(), original)
+            result_path = Path(json.loads(original)["result_path"])
+            completed_result = result_path.read_bytes()
+            self.assertEqual(json.loads(completed_result)["status"], "SUCCESS")
+            self.assertIn("failed", cli(*resume, "--model", "failing-model", status=2))
+            self.assertEqual(record_path.read_bytes(), original)
+            self.assertEqual(result_path.read_bytes(), completed_result)
+
+            verify = cli(*run, "--preset", "verify", "--executor", "agy", "--level", "L2")
+            original = record_path.read_bytes()
+            self.assertIn("ephemeral", cli(*resume, status=2).lower())
+            self.assertEqual(record_path.read_bytes(), original)
+            self.assertTrue(verify["ephemeral"])
+
+    def test_agy_synchronous_argv_and_native_json(self) -> None:
         defaults = load_defaults()
+        adapter = AgyExecutor()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
+            repo = path / "repo"
+            _init_repo(repo)
             req = RunRequest(
-                run_id="host", run_dir=path, brief_path=path / "brief.md", workdir=path,
-                project_root=None, mode="read", preset="general", model=None, effort=None,
-                schema_path=None, output_path=path / "output.md", level="l2",
+                run_id="test", run_dir=path, brief_path=path / "brief.md", workdir=repo,
+                project_root=repo, mode="read", preset="general", level="L2", model=None,
+                effort=None, schema_path=SCHEMAS_DIR / "verdict.schema.json",
+                output_path=path / "out.json", extra_git_dirs=(path / "extra",),
             )
-            for preset, scratch, level in (
-                ("general", False, None),
-                ("general", False, "L2"),
-                ("verify", True, None),
-            ):
-                with self.subTest(preset=preset, scratch=scratch, level=level):
-                    descriptor = AgyExecutor().execute(
-                        replace(req, preset=preset, scratch_verify=scratch, level=level), defaults
-                    )
-                    self.assertEqual(descriptor["status"], "awaiting_host_invoke")
-                    self.assertNotIn("level", descriptor)
+            result = {"status": "SUCCESS", "conversation_id": "test-id", "response": "fallback",
+                      "structured_output": {"title": "hello"}, "usage": {"tokens": 4}}
+            def launch(argv, *, cwd, env, on_stdout_line):
+                running = json.loads((path / "run.json").read_text())
+                self.assertEqual((running["status"], running["executor"], running["mode"]),
+                                 ("running", "agy", req.mode))
+                self.assertEqual(running["scratch_verify"], req.scratch_verify)
+                self.assertEqual(cwd, repo)
+                self.assertEqual(env["KEEL_AGENT_MODE"], req.mode)
+                self.assertEqual(argv[0], "agy")
+                self.assertNotIn("--new-project", argv)
+                self.assertIn("--dangerously-skip-permissions", argv)
+                self.assertEqual(argv[argv.index("--model") + 1],
+                                 defaults["executors"]["agy"]["levels"][req.level]["model"])
+                self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+                self.assertEqual(argv[argv.index("--json-schema") + 1], str(req.schema_path))
+                self.assertEqual(argv[-2], "-p")
+                self.assertIn(f"`{req.brief_path}`", argv[-1])
+                expected_dirs = {str(path)}
+                if req.mode == "write" or req.scratch_verify:
+                    expected_dirs.update((str(repo / ".git"), str(path / "extra")))
+                self.assertEqual({argv[i+1] for i, arg in enumerate(argv) if arg == "--add-dir"},
+                                 expected_dirs)
+                on_stdout_line(json.dumps(result))
+                return 0, ""
 
-    def test_internal_codex_verify_defaults_to_l3_and_enforces_floor(self) -> None:
+            with patch("keel_lib.executors.agy.run_process_group", side_effect=launch):
+                for req.level, req.mode, req.scratch_verify in (
+                    ("L1", "read", False), ("L2", "write", False),
+                    ("L3", "read", True), ("L4", "read", False),
+                ):
+                    with self.subTest(level=req.level):
+                        completed = adapter.execute(req, defaults)
+                        self.assertEqual(completed["status"], "completed")
+                        self.assertEqual(completed["usage"], result["usage"])
+                        self.assertEqual(json.loads(req.output_path.read_text()), result["structured_output"])
+                        self.assertEqual(json.loads((path / "agy-result.json").read_text()), result)
+
+            with patch("keel_lib.executors.agy.run_process_group") as process:
+                for override in (
+                    *({"model": m} for m in ("pro", "flash", "flash_lite", "inherit", "bad model")),
+                    *({"model": "custom-" + suffix, "effort": "medium" if suffix != "medium" else "max"}
+                      for suffix in ("low", "medium", "high", "xhigh", "max")),
+                    {"effort": "unknown"}, {"level": None}, {"preset": "verify", "level": "L1"},
+                ):
+                    with self.subTest(override=override), self.assertRaises(base.KeelConfigError):
+                        adapter.execute(replace(req, **override), defaults)
+                process.assert_not_called()
+
+    def test_internal_codex_verify_requires_level_and_enforces_floor(self) -> None:
         with tempfile.TemporaryDirectory(prefix="keel-verify-") as tmp:
             path = Path(tmp)
             req = RunRequest(
@@ -339,6 +416,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                     ("implement", "write", False),
                     ("verify", "read", False),
                     ("general", "read", True),
+                    ("verify", "read", True),
                 ):
                     with self.subTest(preset=preset, scratch=scratch):
                         missing_level = replace(req, preset=preset, mode=mode, scratch_verify=scratch)
@@ -347,7 +425,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertEqual(launch.call_count, 0)
                 shipped = load_defaults()
                 l3_cfg = shipped["executors"]["codex"]["levels"]["L3"]
-                result = CodexExecutor().execute(req, shipped)
+                result = CodexExecutor().execute(replace(req, level="L3"), shipped)
                 self.assertEqual(launch.call_count, 1)
                 self.assertEqual((result["level"], result["model"], result["effort"]),
                                  ("L3", l3_cfg["model"], l3_cfg["effort"]))
@@ -377,7 +455,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             argv_ro = codex.build_exec_argv(
                 workdir=repo,
                 mode="read",
-                model="gpt-6-astra",
+                model="parent-model",
                 effort="max",
                 output_path=out_file,
                 defaults=defaults,
@@ -385,28 +463,28 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             s_idx = argv_ro.index("-s")
             self.assertEqual(argv_ro[s_idx + 1], "read-only")
             self.assertNotIn("--add-dir", argv_ro)
-            self.assertIn('agents.default_subagent_model="gpt-6-astra"', argv_ro)
+            self.assertIn('agents.default_subagent_model="parent-model"', argv_ro)
             self.assertIn('agents.default_subagent_reasoning_effort="max"', argv_ro)
 
-            # 1b. Explicit `subagent_default` overrides (`gpt-6.1-terra` @ `high`) apply to child subagents cleanly!
+            # 1b. Explicit `subagent_default` overrides (`child-model` @ `high`) apply to child subagents cleanly!
             custom_sub_defaults = {
                 "executors": {
                     "codex": {
-                        "subagent_default": {"model": "gpt-6.1-terra", "effort": "high"},
+                        "subagent_default": {"model": "child-model", "effort": "high"},
                     }
                 }
             }
             argv_custom_sub = codex.build_exec_argv(
                 workdir=repo,
                 mode="read",
-                model="gpt-6-astra",
+                model="parent-model",
                 effort="max",
                 output_path=out_file,
                 defaults=custom_sub_defaults,
             )
-            self.assertEqual(argv_custom_sub[argv_custom_sub.index("-m") + 1], "gpt-6-astra")
+            self.assertEqual(argv_custom_sub[argv_custom_sub.index("-m") + 1], "parent-model")
             self.assertIn('model_reasoning_effort="max"', argv_custom_sub)
-            self.assertIn('agents.default_subagent_model="gpt-6.1-terra"', argv_custom_sub)
+            self.assertIn('agents.default_subagent_model="child-model"', argv_custom_sub)
             self.assertIn('agents.default_subagent_reasoning_effort="high"', argv_custom_sub)
 
             # 2. `mode="read"` inside disposable `/tmp/keel-verify-*` clone (`allow_disposable_write=True`)
@@ -416,7 +494,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             argv_verify = codex.build_exec_argv(
                 workdir=clone_dir,
                 mode="read",
-                model="gpt-6-astra",
+                model="parent-model",
                 effort="max",
                 output_path=out_file,
                 defaults=defaults,
@@ -433,7 +511,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             argv_wt = codex.build_exec_argv(
                 workdir=wt_path,
                 mode="write",
-                model="gpt-6-astra",
+                model="parent-model",
                 effort="max",
                 output_path=out_file,
                 defaults=defaults,
@@ -479,7 +557,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             )
             self.assertNotIn("## Engineering Spine", brief_agy_same)
             self.assertNotIn("Zero data corruption.", brief_agy_same)
-            self.assertNotIn("captured automatically via CLI output", brief_agy_same)
+            self.assertIn("captured automatically via CLI output", brief_agy_same)
 
             # 2. Leak ① fix: AGY with `/tmp` disposable clone OR cross-dir `caller_cwd` OR branch-edited `AGENTS.md`
             # -> MUST inject `AGENTS.md` into `brief.md`!
@@ -589,7 +667,11 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             spec.loader.exec_module(keel_cli)
 
             buf_wt = io.StringIO()
-            with contextlib.redirect_stdout(buf_wt):
+            def agy_stub(argv, *, on_stdout_line, **kwargs):
+                on_stdout_line(json.dumps({"status": "SUCCESS", "conversation_id": "id", "response": "done"}))
+                return 0, ""
+
+            with contextlib.redirect_stdout(buf_wt), patch("keel_lib.executors.agy.run_process_group", agy_stub):
                 rc_wt = keel_cli.main(
                     [
                         "agent",
@@ -616,7 +698,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             codex_wt_argv = codex.build_exec_argv(
                 workdir=Path(wt_payload["workdir"]),
                 mode="read",
-                model="gpt-6-astra",
+                model="parent-model",
                 effort="max",
                 output_path=Path(tmp) / "ro.md",
                 defaults=load_defaults(),

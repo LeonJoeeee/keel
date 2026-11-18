@@ -113,10 +113,22 @@ class RunRequest:
     scratch_verify: bool = False
     level: str | None = None
 
-    @property
-    def is_legacy_scratch_verify(self) -> bool:
-        """Pre-Slice-3 branch verification constructs scratch requests without a level."""
-        return self.level is None and self.preset == "verify" and self.scratch_verify
+    def run_record(self, executor: str) -> dict[str, Any]:
+        """Metadata shared by the turn-one hook, persisted run and warm resume."""
+        return {
+            "run_id": self.run_id,
+            "executor": executor,
+            "preset": self.preset,
+            "mode": self.mode,
+            "level": self.level,
+            "workdir": str(self.workdir),
+            "project_root": str(self.project_root) if self.project_root else None,
+            "brief_path": str(self.brief_path),
+            "output_path": str(self.output_path),
+            "schema_path": str(self.schema_path) if self.schema_path else None,
+            "extra_git_dirs": [str(path) for path in self.extra_git_dirs],
+            "scratch_verify": self.scratch_verify,
+        }
 
 
 class ExecutorAdapter(ABC):

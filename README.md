@@ -1,44 +1,43 @@
 # Keel
 
-Pure-Git, multi-executor engineering spine for **Google Antigravity** and **OpenAI Codex CLI** (`gpt-6-astra @ max`, with a pluggable `1..N` executor interface for future backends).
+Keel lets one developer direct parallel agents across Google Antigravity and OpenAI Codex CLI. Workers get the project's Core need, a bounded task, and an isolated Git worktree. Before a branch lands, an independent verifier exercises the change in a disposable clone. Task history and verification state stay local to the repository.
 
-Keel keeps human attention focused on **first-principles core needs**, **neutral product/architectural tradeoffs**, and **explicit authorization of irreversible actions**, while giving parallel subagents global context registration, isolated local `.agents/worktrees/<slug>` branches, `main`-anchored `docs/tasks/` tracking, clean-context active verification (with 1-line Canary mutation checks), and guarded atomic landing — with zero external dependencies or GitHub Web PR coupling.
+The main session uses `rules/AGENTS.md` §4 to size work, choose an intensity level, and triage review findings. Standalone worker briefs receive §§1–3. The on-demand `keel-repo-ops` skill covers repository setup, task templates, ADRs, releases, and deployments.
 
-## Install (Antigravity Plugin)
+## Install the Antigravity plugin
 
-Install per-entry plugin symlinks into `~/.gemini/config/plugins/keel` (excluding repo-only files like root `AGENTS.md`, `docs/`, and `tests/`) and link `keel` onto your `PATH` (`~/.local/bin/keel`):
+The installer links plugin entries into `~/.gemini/config/plugins/keel` and the CLI into `~/.local/bin`.
 
 ```sh
 ./scripts/install-plugin
+./scripts/install-plugin --check
 ~/.local/bin/agy plugin validate --strict ~/.gemini/config/plugins/keel
 ```
 
-## CLI Overview
+## Run a task
+
+From the target repository, choose a level from L1 through L4 for the difficulty of the slice. Each executor's model and effort mapping lives in `config/defaults.json`. Both adapters return results on exit. Antigravity uses `agy -p` in the selected checkout and reuses its CLI Project.
 
 ```sh
-# 1. Isolated local git worktrees (.agents/worktrees/<slug>, shared across all executors)
-keel worktree create <slug> [--base main]
-keel worktree list
-keel worktree cleanup <slug> [--discard]
-
-# 2. Universal multi-side subagent dispatch (general | implement | verify)
-keel agent run \
-  --executor codex|agy \
-  --mode read|write \
-  --preset general|implement|verify \
-  --worktree <slug> \
-  --why "How this task serves the project's Core need" \
-  --task "Goal, scope boundaries, and deterministic done-checks"
-
-keel agent resume <run_id> --message-file <followup.md>
-
-# 3. Pure-Git branch verification, pure-rebase proof, and guarded atomic landing
-keel branch verify <slug_or_branch> [--executor codex|agy] [--dual] [--check "<cmd>"]
-keel branch record-verdict <slug_or_branch> --verdict-file <path> --head-sha <sha> --executor agy
-keel branch status [<slug_or_branch>]
-keel branch compare --old-base <SHA> --old-head <SHA> --base <SHA> --head <SHA>
-keel branch land <slug_or_branch> [--squash|--ff-only] [--execute | --discard --reason "<why>"]
+keel worktree create parser-fix
+keel agent run --level L2 --executor agy --mode write --preset implement \
+  --worktree parser-fix --why "Keep existing project files readable" \
+  --task "Fix the parser's handling of empty sections and run its regression tests."
 ```
+
+`keel worktree list` shows active worktrees. Use `--task-file <file>` for a written assignment. Continue a resumable run with `keel agent resume <run_id> --message-file <file>` and optionally select a new `--level`.
+
+## Verify and land
+
+Verify the clean, committed branch with its deterministic checks. With a recorded write, Keel selects the other vendor at the write level or L2, whichever is higher. Use `--dual` to run both vendors concurrently. Each verifier gets a separate clone and exercises a realistic workflow, including a one-line Canary mutation to check that the tests detect a break. The gate records the verdict on return.
+
+```sh
+keel branch verify parser-fix --check "python3 -m unittest discover -s tests"
+keel branch status parser-fix
+keel branch land parser-fix
+```
+
+The last command previews the default squash land. With authorization for the target branch, add `--execute` to land or use `--discard --reason "<why>"` to discard. After a pure rebase, use `branch compare` to inspect tree equivalence and pass the verified `--old-base` and `--old-head` to `branch land` with any prior checks. See the [core command reference](rules/AGENTS.md) for syntax.
 
 ## Tests
 
@@ -46,4 +45,4 @@ keel branch land <slug_or_branch> [--squash|--ff-only] [--execute | --discard --
 PYTHONDONTWRITEBYTECODE=1 python3 -W default -m unittest discover -s tests -v
 ```
 
-See [docs/requirements.md](docs/requirements.md) for the first-principles baseline and [docs/architecture.md](docs/architecture.md) for adapter extension details.
+See the [requirements](docs/requirements.md) for project invariants and the [architecture guide](docs/architecture.md) for executor extension details.

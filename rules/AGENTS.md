@@ -17,8 +17,27 @@ Apply these principles when working in software repositories; stay completely ou
 - **Genuine product or architectural tradeoffs:** Present all viable options completely and neutrally first (pros, cons, failure modes, long-term carry cost), placing your recommendation strictly at the end.
 - **Irreversible or external-blast-radius actions** (landing onto the default branch, tagging/releasing/deploying, discarding unintegrated work, force-pushing shared refs, mutating external systems): Require explicit human authorization naming the concrete target unless standing delegation explicitly covers that exact action.
 
-## 4. On-demand workflow skills (load only when needed)
-- **Parallel or isolated subagent execution** (built-in Antigravity, Codex CLI, or worktree management): activate skill `keel-dispatch`.
-- **Direct Antigravity `invoke_subagent` calls:** Use `TypeName="self"` with `Model="inherit"` for research, judgment, implementation, and verification (`Model="flash"` only for trivial mechanical subtasks); never use `TypeName="research"` (its host sandbox strips network and MCP access).
-- **Independent branch verification, review convergence, or landing onto the default branch**: activate skill `keel-integrate`.
-- **Founding/adopting a repository, authoring repo `AGENTS.md` or `docs/tasks/` specs, recording ADRs, or deploying**: activate skill `keel-repo-ops`.
+## 4. Orchestrator core loop (main session only — ignore when executing an assigned .agents/runs/ slice)
+
+- **Size the work (D1).** Execute a small, single-slice change directly. Before dispatching a multi-module overhaul, split it into small sequential slices with independently checkable outcomes. Commit each slice's `docs/tasks/active/<YYYYMMDD>-<slug>.md` on `main` before branching. Give concurrent writers separate worktrees and non-overlapping files.
+- **Choose intensity by task.** Select `--level L1|L2|L3|L4` independently of executor, mode, and preset. `config/defaults.json` maps each level to its model and effort. Use L1 for a narrow mechanical read or scan (forbidden for `verify`), L2 for a clear single-module task or baseline verification, L3 for multi-module implementation or standard verification, and L4 for complex architecture, concurrency or security invariants, or deep rework. For direct Antigravity `invoke_subagent` calls outside Keel, use `TypeName="self"` with `Model="inherit"`. Never use `TypeName="research"`.
+- **Verify before landing (R3, P4).** From a clean, committed worktree, run `keel branch verify <slug>` with the slice's deterministic checks. The default crosses vendors (agy → codex, codex → agy) at `max(L2, write_level)`. Without a recorded write, it uses L3 and the configured verifier. Use `--dual` for concurrent independent reviews in separate disposable clones. Check the locked criteria through realistic caller workflows and confirm a one-line Canary mutation makes the relevant check fail before restoring it.
+- **Triage the verdict.** On `request_changes`, check each `blocking` finding against the caller's workflow, the locked scope, and the Core need. Diagnose the cause, then direct a fix for a confirmed defect or explain why the finding falls outside the slice. Resume the writer or start a fresh run with `--level` one tier higher for rework (capped at L4), then verify again. Optional `notes` can become follow-ups. Stop after two rejected rounds, even with `--dual`, and escalate unresolved blockers. Surface a `[Needs human decision]` tradeoff as soon as it is identified.
+
+Run `keel` (or `~/.gemini/config/plugins/keel/scripts/keel`) from the project. Supply a slice's purpose with `--why` and its goal, file bounds, and done-checks with `--task` or `--task-file`.
+
+```text
+keel worktree create <slug> [--base <ref>]
+keel worktree list
+keel worktree cleanup <slug>
+keel agent run --level <level> [--executor agy|codex] [--mode read|write] [--preset general|implement|verify] [--worktree <slug>] --why <why> (--task <text> | --task-file <file>)
+keel agent resume <run_id> [--level <level>] (--message <text> | --message-file <file>)
+keel branch verify <slug> [--level <level>] [--executor <executor> | --dual] [--check <command>]...
+keel branch status [<slug>]
+keel branch compare --old-base <sha> --old-head <sha> --base <sha> --head <sha>
+keel branch land <slug> [--squash | --ff-only] [--old-base <sha> --old-head <sha>] [--check <command>]... [--execute | --discard --reason <why>]
+```
+
+Preview landing with `branch land <slug>`. For a pure rebase, supply the full commit SHAs of the verified old base and head and rerun prior checks on the rebased head. Execute landing or discard only with the target-specific authorization in §3.
+
+Activate `keel-repo-ops` only when founding or adopting a repository, authoring its root `AGENTS.md`, managing `docs/tasks/` templates, recording ADRs, or cutting releases or deployments.

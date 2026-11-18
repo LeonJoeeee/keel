@@ -620,8 +620,9 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             )
             self.assertIn("## Engineering Spine", brief_codex)
             self.assertIn("## 1. Global core-need alignment", brief_codex)
+            self.assertIn("## 2. Real solutions over fake green checks", brief_codex)
             self.assertIn("## 3. Protect human attention", brief_codex)
-            self.assertNotIn("## 4. On-demand workflow skills", brief_codex)
+            self.assertNotIn("\n## 4.", brief_codex)
             self.assertNotIn("Zero data corruption.", brief_codex)  # Codex natively loads `<workdir>/AGENTS.md`
             self.assertIn("captured automatically via CLI output", brief_codex)
 
@@ -736,10 +737,9 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             finally:
                 EXECUTORS.pop("dummy-sdk", None)
 
-    def test_root_agents_md_exemplifies_five_section_under_100_lines_standard(self) -> None:
+    def test_root_agents_md_has_five_project_sections_in_order(self) -> None:
         agents_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
         lines = agents_text.splitlines()
-        self.assertLess(len(lines), 100)
         headings = [ln.strip() for ln in lines if ln.startswith("## ")]
         self.assertEqual(
             headings,

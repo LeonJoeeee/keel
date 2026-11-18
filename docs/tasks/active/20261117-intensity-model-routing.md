@@ -10,6 +10,7 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
 
 - **Allowed paths:**
   - `config/defaults.json`
+  - `rules/AGENTS.md`
   - `scripts/keel`
   - `scripts/keel_lib/env.py`
   - `scripts/keel_lib/context.py`
@@ -45,10 +46,13 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
     - `L3`: `{"model": "gemini-4-hydrogen-xhigh"}`
     - `L4`: `{"model": "gemini-4-carbon-high"}`
 
-### 2. Explicit `--level`, `verify >= implement` Lock & Rework Escalation (`2A`)
-- **Explicit `--level` required (`L1`–`L4`, case-insensitive normalized to uppercase):**
-  - `keel agent run` requires `--level L1|L2|L3|L4` (if omitted or invalid, raise a clear `KeelError` naming `L1`–`L4` and their scope criteria). Explicit `--model` / `--effort` flags still override the resolved model/effort when passed.
-  - `keel branch verify` (and `keel agent run --preset verify`) requires `--level` AND rejects `L1` (`level >= verify_min_level`, i.e., `L2`).
+### 2. Explicit `--level`, Same-Level Cross-Vendor Diagonal `verify`, & Rework Escalation (`2A`)
+- **Explicit `--level` (`L1`–`L4`, case-insensitive normalized to uppercase):**
+  - `keel agent run` requires `--level L1|L2|L3|L4` (if omitted or invalid, raise a clear `KeelError` naming `L1`–`L4` and their scope criteria; `preset == "verify"` still rejects `L1`). Explicit `--model` / `--effort` flags still override the resolved model/effort when passed.
+  - **Same-level, cross-vendor diagonal jump on `keel branch verify`:**
+    - **Level resolution:** If `--level` is omitted on `keel branch verify` AND `state.get("last_implement_level")` is recorded on the branch, automatically inherit `level = max(state["last_implement_level"], verify_min_level)` (so `L2 -> L2`, `L3 -> L3`, `L4 -> L4`, and `L1 -> L2` floor). If `--level` is omitted AND `last_implement_level` is not recorded (e.g., manual commits without `keel agent run`), raise `KeelError` requiring explicit `--level L2|L3|L4`. If `--level` IS explicitly passed, enforce `level >= max(verify_min_level, state.get("last_implement_level"))`.
+    - **Executor resolution (diagonal jump across vendors):** When `dual=False` and `--executor` is omitted on `keel branch verify`, inspect `state.get("last_implement_executor")`: if `"agy"` -> route `verify` to `"codex"`; if `"codex"` -> route `verify` to `"agy"`; otherwise fall back to `defaults["routing"]["verify"]` (`"codex"`).
+  - **Align `rules/AGENTS.md` §4:** Update `rules/AGENTS.md` §4 so subagent execution routes through `keel-dispatch` (`keel agent run --level L1..L4`) rather than encouraging direct `invoke_subagent(Model="inherit")` on repo tasks (retaining the ban on `TypeName="research"`).
 - **Branch intensity state & invariants (`<git_common_dir>/keel-state/branches/<branch>.json`):**
   - When `keel agent run` or `keel agent resume` runs with `mode == "write"` inside a non-default Git branch `B`:
     1. Compute required rework floor before execution:
@@ -75,7 +79,7 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
 
 - `PYTHONDONTWRITEBYTECODE=1 python3 -W default -m unittest discover -s tests -v` passes with zero warnings, covering:
   - 4-level (`L1`–`L4`) resolution across `codex` and `agy`, explicit `--model`/`--effort` overrides, and missing/invalid `--level` rejection;
-  - `verify >= max(L2, last_implement_level)` enforcement;
+  - Same-level inheritance + cross-vendor diagonal jump (`agy <-> codex`) when `--level`/`--executor` are omitted on `keel branch verify` after an `implement` run, plus `verify >= max(L2, last_implement_level)` enforcement;
   - Automatic rework escalation (`L2 -> L3 -> L4`) after both failed `implement` runs and `request_changes` rounds (on both `agent run` and `agent resume`, without over-escalating consecutive rework passes within the same round);
   - `AgyExecutor` synchronous `agy -p` argv/JSON parsing/schema handling/resume `--conversation` and concurrent `--dual` verification.
 - `./scripts/install-plugin --check` and `~/.local/bin/agy plugin validate --strict ~/.gemini/config/plugins/keel` pass.

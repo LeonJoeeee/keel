@@ -94,3 +94,7 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
 ## Decisions & Findings
 
 - **Owner decisions locked (2026-11-17):** `1A` (4-level `L1`–`L4` ladder matching `Terra high / 6.2 Sol high / 6.2 Astra high / 6.2 Astra xhigh` and `Hydrogen medium / high / xhigh / Carbon high`) + `2A` (mandatory `--level`, `verify >= implement` lock, rework step-up escalation) + `3B` (pure synchronous `agy -p` CLI execution and concurrent `--dual` verification).
+
+## Outcome: [DISCARDED]
+
+- **Reason:** Superseded by clean sliced rebuild stripping async pending-verifier state machine and arbitrary LOC caps

@@ -11,12 +11,13 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
 - **Allowed paths:**
   - `config/defaults.json`
   - `scripts/keel`
+  - `scripts/keel_lib/env.py`
   - `scripts/keel_lib/context.py`
   - `scripts/keel_lib/branch_gate.py`
   - `scripts/keel_lib/executors/{base.py,agy.py,codex.py}`
   - `skills/keel-{dispatch,integrate}/SKILL.md`
   - `AGENTS.md`, `README.md`, `docs/requirements.md`, `docs/architecture.md`
-  - `tests/{test_worktree_and_dispatch.py,test_branch_gate.py}`
+  - `tests/{test_guard_and_env.py,test_worktree_and_dispatch.py,test_branch_gate.py}`
   - `docs/tasks/active/20261117-intensity-model-routing.md`
 - **Hard non-goals & constraints:**
   - Do **not** add a `helper` preset (keep presets strictly `general`, `implement`, `verify`).

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import secrets
+import tempfile
 from typing import Any
 
 from . import KeelError, PLUGIN_ROOT, PRESETS_DIR
@@ -145,11 +147,10 @@ def assemble_brief(
                 "Return valid JSON conforming strictly to the attached output schema."
             )
     elif not inject_schema_in_brief:
-        # Leak ③ fix: clarify `-o` auto-capture for non-schema CLI runs (e.g. `codex exec -o`)
         sections.append(
             "## Output Contract\n\n"
             "Emit your concise final report directly as your final assistant message "
-            "(it is captured automatically via `-o`); do not create extra report files unless explicitly requested."
+            "(it is captured automatically via CLI output). Create extra report files only when explicitly requested."
         )
 
     return "\n\n".join(sections) + "\n"
@@ -164,7 +165,14 @@ def runs_root_dir(project_root: Path | None, fallback_dir: Path) -> Path:
 def save_run_record(run_dir: Path, record: dict[str, Any]) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     meta_path = run_dir / "run.json"
-    meta_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp = tempfile.NamedTemporaryFile(dir=run_dir, mode="w", encoding="utf-8", delete=False)
+    try:
+        with tmp:
+            json.dump(record, tmp, indent=2, ensure_ascii=False)
+            tmp.write("\n")
+        os.replace(tmp.name, meta_path)
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
     return meta_path
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import KeelError
-from .base import ExecutorAdapter, RunRequest
+from .base import ExecutorAdapter, KeelConfigError, RunRequest
 
 VALID_AGY_MODELS = frozenset({"inherit", "flash_lite", "flash", "pro"})
 VALID_AGY_WORKSPACES = frozenset({"inherit", "share", "branch"})
@@ -75,7 +75,17 @@ class AgyExecutor(ExecutorAdapter):
         followup_path: Path,
         output_path: Path,
         defaults: dict[str, Any],
+        *,
+        level: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> dict[str, Any]:
+        """The host sends to the existing session, which owns its model and effort."""
+        if level is not None or model is not None or effort is not None:
+            raise KeelConfigError(
+                "Pre-Slice-3 host-descriptor Antigravity sessions cannot override "
+                "--level, --model, or --effort on resume."
+            )
         pointer = (
             f"Read `{followup_path}` for follow-up instructions on `{record['workdir']}`, "
             f"and write updated output to `{output_path}`."

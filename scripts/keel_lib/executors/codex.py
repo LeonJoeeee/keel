@@ -9,9 +9,17 @@ import shlex
 from typing import Any
 
 from .. import KeelError, PLUGIN_ROOT
-from ..env import run_cmd, run_process_group, same_path, tool_env
-from ..worktree import git_dirs
-from .base import ExecutorAdapter, RunRequest
+from ..env import run_cmd, run_process_group, tool_env
+from .base import (
+    ExecutorAdapter,
+    KeelConfigError,
+    KeelExecutionError,
+    RunRequest,
+    enforce_verify_min_level,
+    normalize_level,
+    resolve_executor_level_config,
+    resolve_git_add_dirs,
+)
 
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
@@ -62,24 +70,6 @@ def discover_mcp_approval_flags(workdir: Path) -> list[str]:
     return accepted
 
 
-def resolve_git_add_dirs(workdir: Path, extra_git_dirs: tuple[Path, ...] = ()) -> list[str]:
-    """Grant Codex `workspace-write` access to split worktree / separate-git-dir metadata directories."""
-    dirs: list[Path] = list(extra_git_dirs)
-    chk = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], cwd=workdir, check=False)
-    if chk.returncode == 0:
-        common_dir, git_dir = git_dirs(workdir)
-        dirs.extend([common_dir, git_dir])
-
-    flags: list[str] = []
-    seen: list[Path] = []
-    for d in dirs:
-        if any(same_path(d, prev) for prev in seen):
-            continue
-        seen.append(d)
-        flags.extend(["--add-dir", str(d)])
-    return flags
-
-
 def inline_hook_flags() -> list[str]:
     hook_cmd = shlex.quote(str(PLUGIN_ROOT / "hooks" / "pre-tool-use"))
     hook_toml = f'hooks.PreToolUse=[{{matcher=".*",hooks=[{{type="command",command="{hook_cmd}",timeout=10}}]}}]'
@@ -106,29 +96,16 @@ def extract_session_id_from_event(line: str) -> str | None:
     return None
 
 
+def _override(value: str | None, default: str) -> str:
+    clean = (value or "").strip()
+    return default if clean in ("", "inherit") else clean
+
+
 class CodexExecutor(ExecutorAdapter):
     name = "codex"
     native_agent_docs = ("AGENTS.md",)
     loads_plugin_spine = False
     inject_schema_in_brief = False  # Enforced natively via `codex exec --output-schema`
-
-    def _resolve_model_effort(
-        self,
-        preset: str,
-        model: str | None,
-        effort: str | None,
-        defaults: dict[str, Any],
-    ) -> tuple[str, str]:
-        cfg = (defaults.get("executors") or {}).get("codex") or {}
-        presets = cfg.get("presets") or {}
-        preset_cfg = presets.get(preset) or presets.get("general") or {}
-        clean_model = model.strip() if isinstance(model, str) else ""
-        clean_effort = effort.strip() if isinstance(effort, str) else ""
-        resolved_model = (
-            clean_model if clean_model and clean_model != "inherit" else preset_cfg.get("model", "gpt-6-astra")
-        )
-        resolved_effort = clean_effort if clean_effort and clean_effort != "inherit" else preset_cfg.get("effort", "max")
-        return resolved_model, resolved_effort
 
     def build_exec_argv(
         self,
@@ -207,7 +184,13 @@ class CodexExecutor(ExecutorAdapter):
         return argv
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
-        model, effort = self._resolve_model_effort(req.preset, req.model, req.effort, defaults)
+        requested_level = "L3" if req.is_legacy_scratch_verify else req.level
+        level, model, effort = resolve_executor_level_config(self.name, requested_level, defaults)
+        if req.preset == "verify":
+            enforce_verify_min_level(level, defaults)
+        assert effort is not None  # Required by the Codex level mapping
+        model = _override(req.model, model)
+        effort = _override(req.effort, effort)
         ephemeral = req.mode == "read" and req.preset == "verify"
         argv = self.build_exec_argv(
             workdir=req.workdir,
@@ -240,22 +223,22 @@ class CodexExecutor(ExecutorAdapter):
                 on_stdout_line=_handle_line,
             )
 
-        if rc != 0:
-            raise KeelError(f"Codex run '{req.run_id}' exited with code {rc}:\n{stderr_text.strip()}".strip())
-
-        final_text = req.output_path.read_text(encoding="utf-8") if req.output_path.is_file() else ""
-        return {
-            "status": "completed",
+        metadata = {
             "executor": self.name,
+            "level": level,
             "model": model,
             "effort": effort,
             "session_id": session_id,
+            "ephemeral": ephemeral,
             "output_path": str(req.output_path),
             "events_path": str(events_path),
             "extra_git_dirs": [str(p) for p in req.extra_git_dirs],
             "scratch_verify": req.scratch_verify,
-            "output_preview": final_text[:1000],
         }
+        if rc != 0:
+            raise KeelExecutionError(f"Codex run '{req.run_id}' exited with code {rc}:\n{stderr_text.strip()}", metadata)
+        final_text = req.output_path.read_text(encoding="utf-8") if req.output_path.is_file() else ""
+        return {**metadata, "status": "completed", "output_preview": final_text[:1000]}
 
     def resume(
         self,
@@ -264,7 +247,15 @@ class CodexExecutor(ExecutorAdapter):
         followup_path: Path,
         output_path: Path,
         defaults: dict[str, Any],
+        *,
+        level: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> dict[str, Any]:
+        if record.get("ephemeral") or (
+            "ephemeral" not in record and record.get("mode") == "read" and record.get("preset") == "verify"
+        ):
+            raise KeelConfigError("Ephemeral Codex verification sessions cannot be resumed.")
         session_id = record.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise KeelError(f"Run '{record.get('run_id')}' has no persisted Codex session_id to resume.")
@@ -273,14 +264,27 @@ class CodexExecutor(ExecutorAdapter):
         if not workdir.is_dir():
             raise KeelError(f"Run workdir no longer exists: {workdir}")
 
+        if level is None:
+            # A warm session keeps the actual settings, including overrides and pre-ladder records.
+            level = record.get("level")
+            if level is not None:
+                level = normalize_level(level)
+            level_model, level_effort = record["model"], record["effort"]
+        else:
+            level, level_model, level_effort = resolve_executor_level_config(self.name, level, defaults)
+        if level is not None and record.get("preset") == "verify":
+            enforce_verify_min_level(level, defaults)
+        assert level_effort is not None
+        model = _override(model, level_model)
+        effort = _override(effort, level_effort)
         extra_dirs = tuple(Path(p) for p in record.get("extra_git_dirs", []))
         schema_str = record.get("schema_path")
         schema_path = Path(schema_str) if isinstance(schema_str, str) and schema_str else None
         argv = self.build_exec_argv(
             workdir=workdir,
             mode=record["mode"],
-            model=record["model"],
-            effort=record["effort"],
+            model=model,
+            effort=effort,
             output_path=output_path,
             defaults=defaults,
             schema_path=schema_path,
@@ -300,14 +304,18 @@ class CodexExecutor(ExecutorAdapter):
                 on_stdout_line=events_fh.write,
             )
 
-        if rc != 0:
-            raise KeelError(f"Codex resume for '{record.get('run_id')}' exited with code {rc}:\n{stderr_text.strip()}".strip())
-
-        final_text = output_path.read_text(encoding="utf-8") if output_path.is_file() else ""
-        return {
-            "status": "completed",
+        metadata = {
             "executor": self.name,
+            "model": model,
+            "effort": effort,
             "session_id": session_id,
             "output_path": str(output_path),
-            "output_preview": final_text[:1000],
         }
+        if level is not None:
+            metadata["level"] = level
+        if rc != 0:
+            raise KeelExecutionError(
+                f"Codex resume for '{record.get('run_id')}' exited with code {rc}:\n{stderr_text.strip()}", metadata
+            )
+        final_text = output_path.read_text(encoding="utf-8") if output_path.is_file() else ""
+        return {**metadata, "status": "completed", "output_preview": final_text[:1000]}

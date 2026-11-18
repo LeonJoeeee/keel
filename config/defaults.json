@@ -1,49 +1,34 @@
 {
   "default_branches": ["main", "master"],
   "max_review_rounds": 2,
+  "levels": ["L1", "L2", "L3", "L4"],
+  "verify_min_level": "L2",
   "routing": {
     "general": "agy",
-    "implement": "codex",
+    "implement": "agy",
     "verify": "codex"
   },
   "executors": {
     "codex": {
-      "models_ranked": [
-        "gpt-6-astra",
-        "gpt-6.1-sol",
-        "gpt-6.1-terra",
-        "gpt-6-luna"
-      ],
-      "presets": {
-        "general": {
-          "model": "gpt-6-astra",
-          "effort": "max"
-        },
-        "implement": {
-          "model": "gpt-6-astra",
-          "effort": "max"
-        },
-        "verify": {
-          "model": "gpt-6-astra",
-          "effort": "max"
-        }
+      "models_ranked": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra"],
+      "levels": {
+        "L1": {"model": "gpt-6.1-terra", "effort": "high"},
+        "L2": {"model": "gpt-6.2-sol", "effort": "high"},
+        "L3": {"model": "gpt-6.2-astra", "effort": "high"},
+        "L4": {"model": "gpt-6.2-astra", "effort": "xhigh"}
       },
-      "subagent_default": {
-        "model": "inherit",
-        "effort": "inherit"
-      }
+      "subagent_default": {"model": "inherit", "effort": "inherit"}
     },
     "agy": {
-      "presets": {
-        "general": {
-          "model": "inherit"
-        },
-        "implement": {
-          "model": "inherit"
-        },
-        "verify": {
-          "model": "inherit"
-        }
+      "models_ranked": [
+        "gemini-4-carbon-high", "gemini-4-hydrogen-xhigh",
+        "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"
+      ],
+      "levels": {
+        "L1": {"model": "gemini-4-hydrogen-medium"},
+        "L2": {"model": "gemini-4-hydrogen-high"},
+        "L3": {"model": "gemini-4-hydrogen-xhigh"},
+        "L4": {"model": "gemini-4-carbon-high"}
       }
     }
   }

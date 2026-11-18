@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+from queue import Queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,7 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from keel_lib import KeelError  # noqa: E402
+from keel_lib import env, KeelError  # noqa: E402
 from keel_lib.env import is_disposable_verify_path, is_subpath, run_cmd, run_process_group, safe_resolve, same_path, tool_env  # noqa: E402
 from keel_lib.guard_rules import detect_agent_mode, evaluate_command  # noqa: E402
 from keel_lib.worktree import create_disposable_clone, create_worktree  # noqa: E402
@@ -659,6 +662,69 @@ class EnvHelpersTests(unittest.TestCase):
             res_nd = run_cmd([sys.executable, "-c", "pass"], cwd=file_path, check=False)
             self.assertEqual(res_nd.returncode, 127)
             self.assertNotIn("Executable not found", res_nd.stderr)
+
+    def test_run_process_groups_in_workers(self) -> None:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(run_process_group, [[sys.executable, "-c", "pass"]] * 4))
+        self.assertEqual(results, [(0, "")] * 4)
+
+    def test_leader_exit_tears_down_descendants_holding_stdout(self) -> None:
+        grandchild = "import time; time.sleep(1); print('orphan')"
+        leader = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {grandchild!r}]); print('leader')"
+        lines = []
+        rc, _ = run_process_group([sys.executable, "-c", leader], on_stdout_line=lines.append)
+        self.assertEqual(rc, 0)
+        self.assertEqual(lines, ["leader\n"])
+
+    def test_signal_forwarding_to_parallel_children(self) -> None:
+        ready = Queue()
+        previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        with env.forward_signals_to_child_groups(), ThreadPoolExecutor(max_workers=2) as pool:
+            children = [
+                pool.submit(
+                    run_process_group,
+                    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_DFL); "
+                     "print('ready', flush=True); time.sleep(5)"],
+                    on_stdout_line=ready.put,
+                )
+                for _ in range(2)
+            ]
+            for _ in children:
+                self.assertEqual(ready.get(timeout=3), "ready\n")
+            signal.raise_signal(signal.SIGTERM)
+            for child in children:
+                self.assertEqual(child.result(timeout=3), (128 + signal.SIGTERM, ""))
+            with self.assertRaises(KeyboardInterrupt):
+                env.check_interrupted()
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+        env.check_interrupted()
+
+    def test_forwarded_interrupt_cannot_report_a_successful_run(self) -> None:
+        def interrupt(_line: str) -> None:
+            signal.raise_signal(signal.SIGINT)
+
+        rc, _ = run_process_group(
+            [sys.executable, "-c", "import signal, sys, time; "
+             "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); print('ready', flush=True); time.sleep(5)"],
+            on_stdout_line=interrupt,
+        )
+        self.assertEqual(rc, 128 + signal.SIGINT)
+
+    def test_callback_exception_reaps_child_group(self) -> None:
+        pgids = []
+
+        def fail(line: str) -> None:
+            pgids.append(int(line))
+            raise ValueError("output consumer failed")
+
+        with self.assertRaisesRegex(ValueError, "output consumer failed"):
+            run_process_group(
+                [sys.executable, "-c", "import os, time; print(os.getpgrp(), flush=True); time.sleep(3)"],
+                on_stdout_line=fail,
+            )
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgids[0], 0)
 
     def test_run_process_group_diagnostics_and_large_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

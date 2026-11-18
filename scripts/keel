@@ -35,6 +35,12 @@ from keel_lib.context import (  # noqa: E402
 )
 from keel_lib.env import is_disposable_verify_path, run_cmd, safe_resolve  # noqa: E402
 from keel_lib.executors import EXECUTORS, RunRequest, get_executor  # noqa: E402
+from keel_lib.executors.base import (  # noqa: E402
+    KeelConfigError,
+    KeelExecutionError,
+    enforce_verify_min_level,
+    normalize_level,
+)
 from keel_lib.guard_rules import detect_agent_mode  # noqa: E402
 from keel_lib.worktree import (  # noqa: E402
     cleanup_worktree,
@@ -93,6 +99,9 @@ def _cmd_worktree_cleanup(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     defaults = load_defaults()
     preset = args.preset
+    norm_level = normalize_level(args.level)
+    if preset == "verify":
+        enforce_verify_min_level(norm_level, defaults)
     mode = args.mode or ("write" if preset == "implement" else "read")
     executor_name = args.executor or defaults.get("routing", {}).get(preset, "codex")
     adapter = get_executor(executor_name)
@@ -158,6 +167,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         project_root=project_root,
         mode=mode,
         preset=preset,
+        level=norm_level,
         model=args.model,
         effort=args.effort,
         schema_path=schema_path,
@@ -165,8 +175,6 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         agy_workspace=args.agy_workspace,
         scratch_verify=scratch_verify,
     )
-    exec_result = adapter.execute(req, defaults)
-
     record: dict[str, Any] = {
         "run_id": run_id,
         "executor": adapter.name,
@@ -176,8 +184,13 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         "project_root": str(project_root) if project_root else None,
         "brief_path": str(brief_path),
         "schema_path": str(schema_path) if schema_path else None,
-        **exec_result,
+        "level": norm_level,
     }
+    try:
+        record.update(adapter.execute(req, defaults))
+    except KeelExecutionError as exc:
+        save_run_record(run_dir, {**record, **exc.partial})
+        raise
     save_run_record(run_dir, record)
     return record
 
@@ -187,6 +200,10 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
     project_root = _resolve_project_root(args.project)
     run_dir, record = load_run_record(project_root, args.run_id, Path(tempfile.gettempdir()))
     adapter = get_executor(record["executor"])
+    level = normalize_level(args.level) if args.level is not None else None
+    effective_level = level or record.get("level")
+    if effective_level is not None and record.get("preset") == "verify":
+        enforce_verify_min_level(effective_level, defaults)
 
     msg = args.message or ""
     if args.message_file:
@@ -198,7 +215,16 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
     followup_path.write_text(msg.strip() + "\n", encoding="utf-8")
     output_path = safe_resolve(args.output) if args.output else Path(record["output_path"])
 
-    res = adapter.resume(run_dir, record, followup_path, output_path, defaults)
+    try:
+        res = adapter.resume(
+            run_dir, record, followup_path, output_path, defaults,
+            level=level, model=args.model, effort=args.effort,
+        )
+    except KeelConfigError:
+        followup_path.unlink(missing_ok=True)
+        raise
+    if level is not None:
+        record["level"] = level
     record.update(res)
     save_run_record(run_dir, record)
     return record
@@ -367,6 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     ag_r.add_argument("--preset", default="general", help="Context preset name (general, implement, verify).")
     ag_r.add_argument("--mode", choices=["read", "write"], help="Sandbox/workspace mode.")
     ag_r.add_argument("--executor", choices=sorted(EXECUTORS), help="Side-agent executor adapter.")
+    ag_r.add_argument("--level", metavar="L1|L2|L3|L4", help="Required task intensity level.")
     ag_r.add_argument("--model")
     ag_r.add_argument("--effort")
     ag_r.add_argument("--project")
@@ -384,6 +411,9 @@ def build_parser() -> argparse.ArgumentParser:
     ag_res.add_argument("run_id")
     ag_res.add_argument("--message")
     ag_res.add_argument("--message-file")
+    ag_res.add_argument("--level", metavar="L1|L2|L3|L4", help="Select a new intensity level for this session.")
+    ag_res.add_argument("--model", help="Codex model override for the resumed session.")
+    ag_res.add_argument("--effort", help="Codex reasoning-effort override for the resumed session.")
     ag_res.add_argument("--project")
     ag_res.add_argument("--output")
     ag_res.set_defaults(func=_cmd_agent_resume)

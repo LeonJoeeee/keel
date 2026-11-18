@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 import errno
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import signal
 import subprocess
 import tempfile
 import threading
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from . import KeelError
 
@@ -127,6 +129,77 @@ def run_cmd(
     return proc
 
 
+_PGIDS_LOCK = threading.Lock()
+_ACTIVE_PGIDS_SNAPSHOT: frozenset[int] = frozenset()
+_INTERRUPTED_BY: int | None = None
+
+
+def _signal_group(pgid: int, signum: int) -> None:
+    try:
+        os.killpg(pgid, signum)
+    except ProcessLookupError:
+        pass  # The group may have exited between snapshot and delivery.
+
+
+def _forward_signal(signum: int, _frame: Any) -> None:
+    global _INTERRUPTED_BY
+    _INTERRUPTED_BY = signum
+    for pgid in _ACTIVE_PGIDS_SNAPSHOT:
+        _signal_group(pgid, signum)
+
+
+@contextmanager
+def forward_signals_to_child_groups() -> Iterator[None]:
+    """Wrap the worker pool on the main thread. Nested/worker runs share its handlers."""
+    global _INTERRUPTED_BY
+    if threading.current_thread() is not threading.main_thread() or signal.getsignal(signal.SIGINT) is _forward_signal:
+        yield
+        return
+
+    previous = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, _forward_signal)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        _INTERRUPTED_BY = None
+
+
+def check_interrupted() -> None:
+    """Stop scheduling new work after an interrupt in the enclosing forwarding scope."""
+    signum = _INTERRUPTED_BY
+    if signum is not None:
+        raise KeyboardInterrupt(f"Interrupted by {signal.Signals(signum).name}")
+
+
+def _close_group(pgid: int) -> None:
+    global _ACTIVE_PGIDS_SNAPSHOT
+    with _PGIDS_LOCK:
+        if pgid in _ACTIVE_PGIDS_SNAPSHOT:
+            _ACTIVE_PGIDS_SNAPSHOT -= {pgid}
+            _signal_group(pgid, signal.SIGKILL)
+
+
+def _wait_for_group_leader(child: subprocess.Popen[str]) -> int:
+    """Reap the leader and close any descendant-held stdout handles when it exits."""
+    try:
+        while _INTERRUPTED_BY is None:
+            try:
+                return child.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                continue
+        # Give an interrupted CLI a chance to flush output before forcing teardown.
+        try:
+            return child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _signal_group(child.pid, signal.SIGKILL)
+            return child.wait()
+    finally:
+        _close_group(child.pid)
+
+
 def run_process_group(
     argv: Sequence[str],
     *,
@@ -135,65 +208,44 @@ def run_process_group(
     stdin_path: Path | None = None,
     on_stdout_line: Callable[[str], None] | None = None,
 ) -> tuple[int, str]:
-    """Run CLI child in its own session, forwarding SIGINT/SIGTERM to the entire process group."""
-    child: subprocess.Popen[str] | None = None
-    prev_int = signal.getsignal(signal.SIGINT)
-    prev_term = signal.getsignal(signal.SIGTERM)
-
-    def _forward(signum: int, _frame: Any) -> None:
-        if child is not None:
-            try:
-                os.killpg(child.pid, signum)
-            except ProcessLookupError:
-                pass
-
-    signal.signal(signal.SIGINT, _forward)
-    signal.signal(signal.SIGTERM, _forward)
-    stderr_text = ""
-    try:
-        stdin_fh = stdin_path.open("r", encoding="utf-8") if stdin_path else subprocess.DEVNULL
+    """Stream CLI output in the calling thread while supervising its whole process group."""
+    global _ACTIVE_PGIDS_SNAPSHOT
+    stdin = stdin_path.open("r", encoding="utf-8") if stdin_path else nullcontext(subprocess.DEVNULL)
+    with stdin as src, forward_signals_to_child_groups(), tempfile.TemporaryFile(mode="w+") as stderr:
+        check_interrupted()
         try:
+            child = subprocess.Popen(
+                list(argv), cwd=cwd, env=env if env is not None else tool_env(), stdin=src,
+                stdout=subprocess.PIPE, stderr=stderr, text=True, start_new_session=True,
+            )
+        except OSError as exc:
+            if cwd is not None and not os.path.isdir(cwd):
+                problem = "not found" if isinstance(exc, FileNotFoundError) else "invalid"
+                return 127, f"Working directory (cwd) {problem}: {cwd} ({exc})"
+            if not isinstance(exc, FileNotFoundError):
+                raise
+            return 127, f"Executable not found: {argv[0]} ({exc})"
+
+        with child, ThreadPoolExecutor(max_workers=1) as waiter:
+            with _PGIDS_LOCK:
+                _ACTIVE_PGIDS_SNAPSHOT |= {child.pid}
             try:
-                child = subprocess.Popen(
-                    list(argv),
-                    cwd=str(cwd) if cwd is not None else None,
-                    env=env if env is not None else tool_env(),
-                    stdin=stdin_fh,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    start_new_session=True,
-                )
-            except OSError as exc:
-                if cwd is not None and not os.path.isdir(cwd):
-                    problem = "not found" if isinstance(exc, FileNotFoundError) else "invalid"
-                    return 127, f"Working directory (cwd) {problem}: {cwd} ({exc})"
-                if not isinstance(exc, FileNotFoundError):
-                    raise
-                return 127, f"Executable not found: {argv[0]} ({exc})"
-            assert child.stdout is not None and child.stderr is not None
-            stderr_chunks: list[str] = []
-
-            def _drain_stderr(stream: Any) -> None:
-                stderr_chunks.append(stream.read())
-
-            err_thread = threading.Thread(target=_drain_stderr, args=(child.stderr,), daemon=True)
-            err_thread.start()
-            for line in child.stdout:
-                if on_stdout_line is not None:
-                    on_stdout_line(line)
-            err_thread.join()
-            child.stdout.close()
-            child.stderr.close()
-            stderr_text = "".join(stderr_chunks)
-            rc = child.wait()
-        finally:
-            if isinstance(stdin_fh, object) and hasattr(stdin_fh, "close"):
-                stdin_fh.close()  # type: ignore[union-attr]
-    finally:
-        signal.signal(signal.SIGINT, prev_int)
-        signal.signal(signal.SIGTERM, prev_term)
-
-    if rc < 0:
-        return 128 + abs(rc), stderr_text
-    return rc, stderr_text
+                # A signal arriving during Popen may have missed this group.
+                signum = _INTERRUPTED_BY
+                if signum is not None:
+                    _signal_group(child.pid, signum)
+                done = waiter.submit(_wait_for_group_leader, child)
+                assert child.stdout is not None
+                for line in child.stdout:
+                    if on_stdout_line is not None:
+                        on_stdout_line(line)
+                rc = done.result()
+            finally:
+                if child.returncode is None:
+                    _close_group(child.pid)
+        stderr.seek(0)
+        error_text = stderr.read()
+        signum = _INTERRUPTED_BY
+        if rc == 0 and signum is not None:
+            rc = -signum
+        return (128 - rc if rc < 0 else rc), error_text

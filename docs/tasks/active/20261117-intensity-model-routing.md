@@ -10,6 +10,7 @@ Switching `AgyExecutor` from two-step host `invoke_subagent` descriptors to sync
 
 - **Allowed paths:**
   - `config/defaults.json`
+  - `config/presets/verify.md`
   - `rules/AGENTS.md`
   - `scripts/keel`
   - `scripts/keel_lib/env.py`

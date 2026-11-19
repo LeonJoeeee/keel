@@ -621,8 +621,10 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertIn("## Engineering Spine", brief_codex)
             self.assertIn("## 1. Global core-need alignment", brief_codex)
             self.assertIn("## 2. Real solutions over fake green checks", brief_codex)
+            self.assertIn("never impose or optimize for arbitrary upfront line-count quotas", brief_codex)
             self.assertIn("## 3. Protect human attention", brief_codex)
             self.assertNotIn("\n## 4.", brief_codex)
+            self.assertNotIn("Orchestrator core loop", brief_codex)
             self.assertNotIn("Zero data corruption.", brief_codex)  # Codex natively loads `<workdir>/AGENTS.md`
             self.assertIn("captured automatically via CLI output", brief_codex)
 

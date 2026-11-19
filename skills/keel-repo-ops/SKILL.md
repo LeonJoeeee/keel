@@ -15,8 +15,8 @@ Use these five sections in order.
 1. **`## Core need`:** State the real first-principles problem the project solves and what user/architectural value must not be traded away for local shortcuts.
 2. **`## Architecture & Boundaries`:** High-level module ownership, runtime boundaries, and hard invariants.
 3. **`## Commands`:** Verified build, lint, test, and validation commands.
-4. **`## Gotchas`:** Only real, non-obvious traps hit in practice — never speculative boilerplate.
-5. **`## Where to look`:** Strictly **conditional routing** (`"When doing X -> read Y"`), never mandatory upfront pre-reads that bloat every turn.
+4. **`## Gotchas`:** Focus on real, non-obvious traps hit in practice rather than speculative boilerplate.
+5. **`## Where to look`:** Prefer **conditional routing** (`"When doing X -> read Y"`) over mandatory upfront pre-reads on every turn.
 
 ## 2. Repo-native `docs/tasks/` ledger (`main`-anchored, zero-conflict)
 Replace external issue trackers with `docs/tasks/{todo,active,archive}/<YYYYMMDD>-<slug>.md` for non-trivial work. Handle a small, single-slice change directly (`D1`).

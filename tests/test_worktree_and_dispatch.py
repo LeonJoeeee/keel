@@ -621,7 +621,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertIn("## Engineering Spine", brief_codex)
             self.assertIn("## 1. Global core-need alignment", brief_codex)
             self.assertIn("## 2. Real solutions over fake green checks", brief_codex)
-            self.assertIn("never impose or optimize for arbitrary upfront line-count quotas", brief_codex)
+            self.assertIn("avoid arbitrary line-count quotas", brief_codex)
             self.assertIn("## 3. Protect human attention", brief_codex)
             self.assertNotIn("\n## 4.", brief_codex)
             self.assertNotIn("Orchestrator core loop", brief_codex)

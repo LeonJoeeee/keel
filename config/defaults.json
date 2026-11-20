@@ -21,13 +21,14 @@
     },
     "agy": {
       "models_ranked": [
-        "gemini-4-carbon-high", "gemini-4-hydrogen-xhigh",
-        "gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"
+        "gemini-4-carbon-high", "gemini-4-neon-xhigh",
+        "gemini-4-neon-high", "gemini-4-neon-medium",
+        "gemini-4-hydrogen-high"
       ],
       "levels": {
-        "L1": {"model": "gemini-4-hydrogen-medium"},
-        "L2": {"model": "gemini-4-hydrogen-high"},
-        "L3": {"model": "gemini-4-hydrogen-xhigh"},
+        "L1": {"model": "gemini-4-hydrogen-high"},
+        "L2": {"model": "gemini-4-neon-medium"},
+        "L3": {"model": "gemini-4-neon-high"},
         "L4": {"model": "gemini-4-carbon-high"}
       }
     }

@@ -151,8 +151,28 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         levels = ["L1", "L2", "L3", "L4"]
         self.assertEqual(defaults["levels"], levels)
         self.assertEqual(defaults["routing"], {"general": "agy", "implement": "agy", "verify": "codex"})
+        self.assertEqual(
+            defaults["executors"]["agy"],
+            {
+                "models_ranked": [
+                    "gemini-4-carbon-high",
+                    "gemini-4-neon-xhigh",
+                    "gemini-4-neon-high",
+                    "gemini-4-neon-medium",
+                    "gemini-4-hydrogen-high",
+                ],
+                "levels": {
+                    "L1": {"model": "gemini-4-hydrogen-high"},
+                    "L2": {"model": "gemini-4-neon-medium"},
+                    "L3": {"model": "gemini-4-neon-high"},
+                    "L4": {"model": "gemini-4-carbon-high"},
+                },
+            },
+        )
         for executor, require_effort in (("codex", True), ("agy", False)):
+            ranked = defaults["executors"][executor]["models_ranked"]
             cfg_levels = defaults["executors"][executor]["levels"]
+            rank_positions: list[int] = []
             for level in levels:
                 with self.subTest(executor=executor, level=level):
                     entry = cfg_levels[level]
@@ -161,6 +181,9 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                         base.resolve_executor_level_config(executor, level.lower(), defaults),
                         (level, entry["model"], expected_effort),
                     )
+                    self.assertIn(entry["model"], ranked)
+                    rank_positions.append(ranked.index(entry["model"]))
+            self.assertEqual(rank_positions, sorted(rank_positions, reverse=True))
 
         synthetic = {
             "levels": levels,

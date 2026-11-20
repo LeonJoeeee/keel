@@ -385,7 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     br_v.add_argument("--why")
     br_v.add_argument("--context-file")
     br_v.add_argument("--output-dir")
-    br_v.add_argument("--force-round", action="store_true")
+    br_v.add_argument(
+        "--force-round",
+        action="store_true",
+        help="Only for explicit human-authorized escalations after hitting the convergence cap.",
+    )
     br_v.set_defaults(func=_cmd_branch_verify)
 
     br_st = br_sub.add_parser("status", help="Inspect repo-wide task/worktree overview or a branch's gate status.")

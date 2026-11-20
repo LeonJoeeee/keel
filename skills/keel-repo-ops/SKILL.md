@@ -19,7 +19,7 @@ Use these five sections in order.
 5. **`## Where to look`:** Prefer **conditional routing** (`"When doing X -> read Y"`) over mandatory upfront pre-reads on every turn.
 
 ## 2. Repo-native `docs/tasks/` ledger (`main`-anchored, zero-conflict)
-Replace external issue trackers with `docs/tasks/{todo,active,archive}/<YYYYMMDD>-<slug>.md` for non-trivial work. Handle a small, single-slice change directly (`D1`).
+Replace external issue trackers with `docs/tasks/{todo,active,archive}/<YYYYMMDD>-<slug>.md` for non-trivial work. Reserve direct main-session edits for trivial, few-line changes, and dispatch substantive slices to a clean-context writer (`D1`).
 
 - **Orchestrator owns opening on `main`:** Open and commit task specs in `docs/tasks/todo/` or `docs/tasks/active/` directly on `main` **before** branching `.agents/worktrees/<slug>` (`hooks/pre-tool-use` permits `git commit` on `main` iff every touched path is under `docs/tasks/`).
 - **Spec structure:**

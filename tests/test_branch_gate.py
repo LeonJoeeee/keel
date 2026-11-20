@@ -205,7 +205,9 @@ class BranchGateTests(unittest.TestCase):
             # Verify `main`'s IMMUTABLE locked spec ("calc.py only.") was injected into the verifier's brief!
             self.assertIn("calc.py only.", captured_briefs[0])
             self.assertEqual(dual_r1["request_changes_rounds"], 1)
+            self.assertIs(dual_r1["forced_round"], False)
             self.assertEqual(set(dual_r1["verifiers"]), {"agy", "codex"})
+            self.assertIs(load_branch_state(repo / ".git", "task/mul")["rounds"][-1]["forced_round"], False)
             self.assertFalse(_run_cli(["branch", "status", "mul", "--project", str(repo)])["ready_to_land"])
 
             # Author fixes the defect on a new commit
@@ -370,11 +372,29 @@ class BranchGateTests(unittest.TestCase):
                 return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_rc):
-                _run_cli(["branch", "verify", "sub", "--project", str(repo)])
-                _run_cli(["branch", "verify", "sub", "--project", str(repo)])
-                # 3rd round blocked by 2-round circuit breaker unless `--force-round`!
-                with self.assertRaisesRegex(KeelError, "convergence cap"):
+                r1 = _run_cli(["branch", "verify", "sub", "--project", str(repo)])
+                r2 = _run_cli(["branch", "verify", "sub", "--project", str(repo)])
+                self.assertIs(r1["forced_round"], False)
+                self.assertIs(r2["forced_round"], False)
+                saved_rounds = load_branch_state(repo / ".git", "task/sub")["rounds"]
+                self.assertEqual([entry["forced_round"] for entry in saved_rounds], [False, False])
+                # 3rd round blocked by 2-round circuit breaker and must NOT suggest `--force-round`!
+                with self.assertRaises(KeelError) as cap_ctx:
                     _run_cli(["branch", "verify", "sub", "--project", str(repo)])
+                cap_msg = str(cap_ctx.exception)
+                self.assertIn("convergence cap", cap_msg)
+                self.assertNotIn("--force-round", cap_msg)
+                self.assertNotIn("force-round", cap_msg.lower())
+
+            # CLI `--help` on `branch verify` documents `--force-round` as human-authorized escalation only
+            help_buf = io.StringIO()
+            with contextlib.redirect_stdout(help_buf):
+                with self.assertRaises(SystemExit) as help_exit:
+                    KEEL_CLI.build_parser().parse_args(["branch", "verify", "--help"])
+            self.assertEqual(help_exit.exception.code, 0)
+            help_text = help_buf.getvalue()
+            self.assertIn("--force-round", help_text)
+            self.assertIn("human-authorized", help_text.lower())
 
             # Fix code, run authorized `--force-round` with `--check` -> approves `old_head`
             (wt_path / "calc.py").write_text(
@@ -402,7 +422,7 @@ class BranchGateTests(unittest.TestCase):
                 return {"status": "completed", "executor": "codex", "model": "test-codex", "effort": "max"}
 
             with mock.patch.object(CodexExecutor, "execute", fake_ok):
-                _run_cli(
+                forced_res = _run_cli(
                     [
                         "branch",
                         "verify",
@@ -414,6 +434,8 @@ class BranchGateTests(unittest.TestCase):
                         "python3 -c 'import calc; assert calc.sub(5, 2) == 3'",
                     ]
                 )
+            self.assertIs(forced_res["forced_round"], True)
+            self.assertIs(load_branch_state(repo / ".git", "task/sub")["rounds"][-1]["forced_round"], True)
 
             self.assertTrue(_run_cli(["branch", "land", "sub", "--project", str(repo)])["ready_to_land"])
 

@@ -18,7 +18,7 @@ Layer 1 defines the outcomes a rebuild must preserve. Layer 2 records how Keel s
 
 ### Detailed Needs (`D1`–`D3`)
 
-- **`D1` — Size the work proportionally.** Execute a small, single-slice change directly. Before dispatching a multi-module overhaul, divide it into small, sequential slices with independently checkable outcomes. Existing repositories, branches without task files, and offline or SSH-remote workflows must work without mandatory ticket templates, hosted pull requests, or custom CI job names.
+- **`D1` — Size the work proportionally.** Reserve direct main-session edits for trivial, few-line changes where writing a brief outweighs the edit; dispatch substantive single-slice work to a clean-context writer matched to the slice's difficulty. Before dispatching a multi-module overhaul, divide it into small, sequential slices with independently checkable outcomes. Existing repositories, branches without task files, and offline or SSH-remote workflows must work without mandatory ticket templates, hosted pull requests, or custom CI job names.
 - **`D2` — Keep casual chat free of workflow overhead.** Non-engineering conversations incur near-zero token overhead and zero workflow prompts.
 - **`D3` — Keep the harness thin and rebuildable.** Separate durable requirements, configuration, and execution glue by responsibility so each can be changed or rebuilt independently. Maintaining the glue must never eclipse the project work it supports.
 

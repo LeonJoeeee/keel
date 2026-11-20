@@ -642,8 +642,10 @@ def verify_branch(
     def check_round_limit(state: dict[str, Any]) -> None:
         rejected = _request_changes_count(state.get("rounds", []))
         if rejected >= max_rounds and not force_round:
-            raise KeelError(f"Branch '{branch}' reached its {max_rounds}-round convergence cap. "
-                            "Escalate to the human or pass --force-round if authorized.")
+            raise KeelError(
+                f"Branch '{branch}' reached its {max_rounds}-round convergence cap. "
+                "Stop looping and escalate unresolved blockers to the human."
+            )
 
     check_round_limit(initial_state)
     last_write = initial_state.get("last_write") or {}
@@ -749,7 +751,8 @@ def verify_branch(
         state["rounds"].append({
             "head_sha": head_sha, "merge_base_sha": merge_base_sha, "task_file": task_file,
             "task_blob_sha": task_blob_sha, "dual": dual, "level": level,
-            "implement_level": implement_level, "outcome": outcome, "verdicts": verdicts,
+            "implement_level": implement_level, "forced_round": bool(force_round),
+            "outcome": outcome, "verdicts": verdicts,
             "recorded_at": _now_iso(),
         })
         if task_file:
@@ -757,8 +760,9 @@ def verify_branch(
         rejected = _request_changes_count(state["rounds"])
     return {
         "branch": branch, "slug": slug, "base_ref": base_ref, "head_sha": head_sha,
-        "task_file": task_file, "level": level, "dual": dual, "outcome": outcome,
-        "request_changes_rounds": rejected, **({"verifiers": runs} if dual else single_run),
+        "task_file": task_file, "level": level, "dual": dual, "forced_round": bool(force_round),
+        "outcome": outcome, "request_changes_rounds": rejected,
+        **({"verifiers": runs} if dual else single_run),
     }
 
 

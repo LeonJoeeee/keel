@@ -661,6 +661,8 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertIn("## 3. Protect human attention", brief_codex)
             self.assertNotIn("\n## 4.", brief_codex)
             self.assertNotIn("Orchestrator core loop", brief_codex)
+            self.assertNotIn("Default to Orchestrator", brief_codex)
+            self.assertNotIn("--force-round", brief_codex)
             self.assertNotIn("Zero data corruption.", brief_codex)  # Codex natively loads `<workdir>/AGENTS.md`
             self.assertIn("captured automatically via CLI output", brief_codex)
 
@@ -793,13 +795,18 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         spine_text = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
         sec4 = spine_text[spine_text.index("## 4. Orchestrator core loop") :]
         for required_clause in (
+            "Default to Orchestrator; dispatch substantive writers (R1, R5, D1).",
+            "Reserve direct main-session edits strictly for trivial, few-line single-point changes where writing a brief outweighs the edit.",
+            "keel agent run --mode write --preset implement",
+            "keel agent resume",
             "Handle a single cohesive slice (including coupled cross-file edits that must change together to pass checks)",
-            "Whether coding directly or dispatching via `keel agent run`, split any multi-part overhaul by responsibility",
+            "Split any multi-part overhaul by responsibility",
             "get `approve` from `keel branch verify` on slice N before starting slice N+1",
             "keel worktree create <slice-N+1> --base task/<slice-N>",
             "lock non-trivial stacked specs in `docs/tasks/todo/<YYYYMMDD>-<slug>.md` on `main` before branching the stack and pass `--task-file`",
             "never mutate an already-verified parent branch",
             "Verify each slice before advancing or landing (R3, P4).",
+            "standing execution or landing delegation never authorizes `--force-round`, which requires explicit human authorization for that specific escalation",
             "keel branch verify <slug> [--base <ref>] [--task-file <file>] [--why <why>] [--context-file <file>] [--level <level>]",
             "keel branch status [<slug>] [--base <ref>]",
             "keel branch land <slug> [--base <ref>] [--squash | --ff-only]",
@@ -809,6 +816,14 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         ):
             with self.subTest(clause=required_clause):
                 self.assertIn(required_clause, sec4)
+
+        req_text = (ROOT / "docs" / "requirements.md").read_text(encoding="utf-8")
+        self.assertIn("Reserve direct main-session edits for trivial, few-line changes", req_text)
+        self.assertIn("dispatch substantive single-slice work to a clean-context writer", req_text)
+        self.assertIn("without mandatory ticket templates, hosted pull requests, or custom CI job names", req_text)
+
+        skill_text = (ROOT / "skills" / "keel-repo-ops" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Reserve direct main-session edits for trivial, few-line changes, and dispatch substantive slices to a clean-context writer (`D1`).", skill_text)
 
     def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
         installer = ROOT / "scripts" / "install-plugin"

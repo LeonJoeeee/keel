@@ -1523,6 +1523,265 @@ class BranchGateTests(unittest.TestCase):
             self.assertFalse(revised_rebase_land["ready_to_land"])
             self.assertTrue(any("revised task criteria" in b for b in revised_rebase_land["blockers"]))
 
+    def test_stacked_slices_incremental_verify_and_ordered_ff_only_land(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            m0_sha, base_task = _init_repo_with_task(repo, slug="unrelated")
+            _git(repo, "rm", "-f", base_task)
+            _git(repo, "commit", "-m", "docs(tasks): clear initial active task")
+            m0_sha = _git(repo, "rev-parse", "HEAD")
+
+            seen_briefs: list[str] = []
+
+            def fake_codex(self_exec: Any, req: Any, defaults: dict[str, Any]) -> dict[str, Any]:
+                seen_briefs.append(req.brief_path.read_text(encoding="utf-8"))
+                req.output_path.write_text(
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "summary": "Incremental slice verified",
+                            "blocking": [],
+                            "notes": [],
+                            "commands_run": ["python3 -c 'import calc'"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return {"status": "completed", "executor": "codex", "level": req.level, "model": "test-codex", "effort": "high"}
+
+            # 1) Three-slice stack (`slice-1 -> slice-2 -> slice-3`) while `main` stays untouched at `m0_sha`
+            wt1 = Path(_run_cli(["worktree", "create", "slice-1", "--project", str(repo)])["path"])
+            (wt1 / "calc.py").write_text(
+                "def add(a: int, b: int) -> int:\n    return a + b\n\ndef sub(a: int, b: int) -> int:\n    return a - b\n",
+                encoding="utf-8",
+            )
+            _git(wt1, "add", "calc.py")
+            _git(wt1, "commit", "-m", "feat: slice 1 sub")
+            s1_sha = _git(wt1, "rev-parse", "HEAD")
+
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                v1 = _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "slice-1",
+                        "--why",
+                        "Verify sub() slice.",
+                        "--project",
+                        str(repo),
+                        "--check",
+                        "python3 -c 'import calc; assert calc.sub(5, 2) == 3'",
+                    ]
+                )
+            self.assertEqual(v1["outcome"], "approve")
+            self.assertEqual(_git(repo, "rev-parse", "main"), m0_sha)
+
+            wt2 = Path(_run_cli(["worktree", "create", "slice-2", "--base", "task/slice-1", "--project", str(repo)])["path"])
+            (wt2 / "mult.py").write_text("def mul(a: int, b: int) -> int:\n    return a * b\n", encoding="utf-8")
+            _git(wt2, "add", "mult.py")
+            _git(wt2, "commit", "-m", "feat: slice 2 mul")
+            s2_sha = _git(wt2, "rev-parse", "HEAD")
+
+            ctx2 = Path(tmp) / "slice2-ctx.md"
+            ctx2.write_text("Bounds: mult.py only.\n", encoding="utf-8")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                v2 = _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "slice-2",
+                        "--base",
+                        "task/slice-1",
+                        "--why",
+                        "Verify mul() slice.",
+                        "--context-file",
+                        str(ctx2),
+                        "--project",
+                        str(repo),
+                        "--check",
+                        "python3 -c 'import mult; assert mult.mul(3, 4) == 12'",
+                    ]
+                )
+            self.assertEqual(v2["outcome"], "approve")
+            self.assertIn(f"git diff {s1_sha}..{s2_sha}", seen_briefs[-1])
+            self.assertIn("Bounds: mult.py only.", seen_briefs[-1])
+            self.assertNotIn("feat: slice 1 sub", seen_briefs[-1])
+
+            # Leaf slice `slice-3` can even carry its own active task file on the top of the stack
+            wt3 = Path(_run_cli(["worktree", "create", "slice-3", "--base", "task/slice-2", "--project", str(repo)])["path"])
+            task3 = wt3 / "docs/tasks/active/20261119-slice-3.md"
+            task3.parent.mkdir(parents=True, exist_ok=True)
+            task3.write_text("# Slice 3\n\n## Goal & Why\nAdd div().\n\n## Bounds\ndiv.py\n\n## Done-check\npython3 -c 'import div'\n", encoding="utf-8")
+            (wt3 / "div.py").write_text("def div(a: int, b: int) -> float:\n    return a / b\n", encoding="utf-8")
+            _git(wt3, "add", ".")
+            _git(wt3, "commit", "-m", "feat: slice 3 div")
+            s3_sha = _git(wt3, "rev-parse", "HEAD")
+
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                v3 = _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "slice-3",
+                        "--base",
+                        "task/slice-2",
+                        "--project",
+                        str(repo),
+                        "--check",
+                        "python3 -c 'import div; assert div.div(6, 2) == 3.0'",
+                    ]
+                )
+            self.assertEqual(v3["outcome"], "approve")
+            self.assertIn(f"git diff {s2_sha}..{s3_sha}", seen_briefs[-1])
+            self.assertNotIn("feat: slice 2 mul", seen_briefs[-1])
+
+            # Out-of-order land of `slice-2` or `slice-3` directly onto `main` is blocked (`merge-base` mismatch)
+            for premature in ("slice-2", "slice-3"):
+                blocked = _run_cli(["branch", "land", premature, "--project", str(repo)])
+                self.assertFalse(blocked["ready_to_land"])
+                self.assertTrue(any("merge-base" in b for b in blocked["blockers"]))
+
+            # Mutating verified parent `task/slice-1` invalidates its approval until restored
+            (wt1 / "extra.txt").write_text("unverified\n", encoding="utf-8")
+            _git(wt1, "add", "extra.txt")
+            _git(wt1, "commit", "-m", "chore: mutate parent")
+            mutated_gate = _run_cli(["branch", "land", "slice-1", "--project", str(repo)])
+            self.assertFalse(mutated_gate["ready_to_land"])
+            _git(wt1, "reset", "--hard", s1_sha)
+
+            # Ordered `--ff-only` on parent slices advances `main` cleanly (`M0 -> S1 -> S2`), then `slice-3` squash-lands & archives!
+            land1 = _run_cli(["branch", "land", "slice-1", "--ff-only", "--project", str(repo), "--execute"])
+            self.assertTrue(land1["landed"])
+            self.assertEqual(_git(repo, "rev-parse", "main"), s1_sha)
+
+            land2 = _run_cli(["branch", "land", "slice-2", "--ff-only", "--project", str(repo), "--execute"])
+            self.assertTrue(land2["landed"])
+            self.assertEqual(_git(repo, "rev-parse", "main"), s2_sha)
+
+            land3 = _run_cli(["branch", "land", "slice-3", "--project", str(repo), "--execute"])
+            self.assertTrue(land3["landed"])
+            self.assertTrue(land3["approval_source"].startswith("direct-approve:"))
+            self.assertEqual(land3["archived_task"], "docs/tasks/archive/20261119-slice-3.md")
+
+            # 2) Recovery path when a stacked parent inherited an active task file from `main`:
+            #    `--ff-only` adds an archival commit on `main`, so the child rebases `--onto main <parent_sha>`
+            #    and lands via `--old-base <parent_sha> --old-head <child_old_sha>` + rerun `--check`!
+            inherited_task = repo / "docs/tasks/active/20261119-parent-task.md"
+            inherited_task.parent.mkdir(parents=True, exist_ok=True)
+            inherited_task.write_text("# Parent\n\n## Goal & Why\nP.\n\n## Bounds\np.py\n\n## Done-check\ntrue\n", encoding="utf-8")
+            _git(repo, "add", str(inherited_task.relative_to(repo)))
+            _git(repo, "commit", "-m", "docs(tasks): open parent-task on main")
+
+            wt_p = Path(_run_cli(["worktree", "create", "parent-task", "--project", str(repo)])["path"])
+            (wt_p / "p.py").write_text("P = 1\n", encoding="utf-8")
+            _git(wt_p, "add", "p.py")
+            _git(wt_p, "commit", "-m", "feat: p")
+            p_sha = _git(wt_p, "rev-parse", "HEAD")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(["branch", "verify", "parent-task", "--project", str(repo), "--check", "python3 -c 'import p'"])
+
+            wt_c = Path(_run_cli(["worktree", "create", "child-slice", "--base", "task/parent-task", "--project", str(repo)])["path"])
+            (wt_c / "c.py").write_text("C = 2\n", encoding="utf-8")
+            _git(wt_c, "add", "c.py")
+            _git(wt_c, "commit", "-m", "feat: c")
+            c_old_sha = _git(wt_c, "rev-parse", "HEAD")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "child-slice",
+                        "--base",
+                        "task/parent-task",
+                        "--why",
+                        "Verify child slice.",
+                        "--project",
+                        str(repo),
+                        "--check",
+                        "python3 -c 'import c'",
+                    ]
+                )
+
+            land_p = _run_cli(["branch", "land", "parent-task", "--ff-only", "--project", str(repo), "--execute"])
+            self.assertTrue(land_p["landed"])
+            self.assertEqual(land_p["archived_task"], "docs/tasks/archive/20261119-parent-task.md")
+            self.assertNotEqual(_git(repo, "rev-parse", "main"), p_sha)
+
+            preview_c = _run_cli(["branch", "land", "child-slice", "--project", str(repo)])
+            self.assertFalse(preview_c["ready_to_land"])
+            self.assertTrue(any("behind 'main' tip" in b for b in preview_c["blockers"]))
+
+            _git(wt_c, "rebase", "--onto", "main", p_sha)
+            land_c = _run_cli(
+                [
+                    "branch",
+                    "land",
+                    "child-slice",
+                    "--project",
+                    str(repo),
+                    "--old-base",
+                    p_sha,
+                    "--old-head",
+                    c_old_sha,
+                    "--check",
+                    "python3 -c 'import c'",
+                    "--execute",
+                ]
+            )
+            self.assertTrue(land_c["landed"])
+            self.assertTrue(land_c["approval_source"].startswith("pure-rebase-from:"))
+
+            # 3) Non-trivial stacked specs locked in `docs/tasks/todo/` on `main` + `--task-file`:
+            #    preserves `Locked Task Specification` (`P2`/`R2`) AND fast-forwards `main` to exact parent SHA without rebase!
+            todo1_rel = "docs/tasks/todo/20261119-todo-parent.md"
+            todo2_rel = "docs/tasks/todo/20261119-todo-child.md"
+            (repo / todo1_rel).write_text("# Todo 1\n\n## Goal & Why\nT1.\n\n## Bounds\nt1.py only.\n\n## Done-check\npython3 -c 'import t1'\n", encoding="utf-8")
+            (repo / todo2_rel).write_text("# Todo 2\n\n## Goal & Why\nT2.\n\n## Bounds\nt2.py only.\n\n## Done-check\npython3 -c 'import t2'\n", encoding="utf-8")
+            _git(repo, "add", todo1_rel, todo2_rel)
+            _git(repo, "commit", "-m", "docs(tasks): lock stacked todo specs on main")
+
+            wt_t1 = Path(_run_cli(["worktree", "create", "todo-parent", "--project", str(repo)])["path"])
+            (wt_t1 / "t1.py").write_text("T1 = 1\n", encoding="utf-8")
+            _git(wt_t1, "add", "t1.py")
+            _git(wt_t1, "commit", "-m", "feat: t1")
+            t1_sha = _git(wt_t1, "rev-parse", "HEAD")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(["branch", "verify", "todo-parent", "--task-file", todo1_rel, "--project", str(repo), "--check", "python3 -c 'import t1'"])
+            self.assertIn("### Locked Task Specification on `main`", seen_briefs[-1])
+            self.assertIn("t1.py only.", seen_briefs[-1])
+
+            wt_t2 = Path(_run_cli(["worktree", "create", "todo-child", "--base", "task/todo-parent", "--project", str(repo)])["path"])
+            (wt_t2 / "t2.py").write_text("T2 = 2\n", encoding="utf-8")
+            _git(wt_t2, "add", "t2.py")
+            _git(wt_t2, "commit", "-m", "feat: t2")
+            with mock.patch.object(CodexExecutor, "execute", fake_codex):
+                _run_cli(
+                    [
+                        "branch",
+                        "verify",
+                        "todo-child",
+                        "--base",
+                        "task/todo-parent",
+                        "--task-file",
+                        todo2_rel,
+                        "--project",
+                        str(repo),
+                        "--check",
+                        "python3 -c 'import t2'",
+                    ]
+                )
+            self.assertIn("### Locked Task Specification on `task/todo-parent`", seen_briefs[-1])
+            self.assertIn("t2.py only.", seen_briefs[-1])
+
+            land_t1 = _run_cli(["branch", "land", "todo-parent", "--ff-only", "--project", str(repo), "--execute"])
+            self.assertTrue(land_t1["landed"])
+            self.assertIsNone(land_t1["archived_task"])
+            self.assertEqual(_git(repo, "rev-parse", "main"), t1_sha)
+
+            land_t2 = _run_cli(["branch", "land", "todo-child", "--ff-only", "--project", str(repo), "--execute"])
+            self.assertTrue(land_t2["landed"])
+            self.assertTrue(land_t2["approval_source"].startswith("direct-approve:"))
+
 
 if __name__ == "__main__":
     unittest.main()

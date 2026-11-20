@@ -777,6 +777,26 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             ],
         )
 
+        spine_text = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+        sec4 = spine_text[spine_text.index("## 4. Orchestrator core loop") :]
+        for required_clause in (
+            "Handle a single cohesive slice (including coupled cross-file edits that must change together to pass checks)",
+            "Whether coding directly or dispatching via `keel agent run`, split any multi-part overhaul by responsibility",
+            "get `approve` from `keel branch verify` on slice N before starting slice N+1",
+            "keel worktree create <slice-N+1> --base task/<slice-N>",
+            "lock non-trivial stacked specs in `docs/tasks/todo/<YYYYMMDD>-<slug>.md` on `main` before branching the stack and pass `--task-file`",
+            "never mutate an already-verified parent branch",
+            "Verify each slice before advancing or landing (R3, P4).",
+            "keel branch verify <slug> [--base <ref>] [--task-file <file>] [--why <why>] [--context-file <file>] [--level <level>]",
+            "keel branch status [<slug>] [--base <ref>]",
+            "keel branch land <slug> [--base <ref>] [--squash | --ff-only]",
+            "land slices in order using `--ff-only` on parent slices",
+            "if a parent has no `docs/tasks/active/` file to archive (including one inherited from `main`)",
+            "rebase the child `--onto main <parent-head-sha>`",
+        ):
+            with self.subTest(clause=required_clause):
+                self.assertIn(required_clause, sec4)
+
     def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
         installer = ROOT / "scripts" / "install-plugin"
         expected_entries = {

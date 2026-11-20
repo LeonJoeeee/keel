@@ -152,6 +152,19 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         self.assertEqual(defaults["levels"], levels)
         self.assertEqual(defaults["routing"], {"general": "agy", "implement": "agy", "verify": "codex"})
         self.assertEqual(
+            defaults["executors"]["codex"],
+            {
+                "models_ranked": ["gpt-6.2-astra", "gpt-6.2-sol"],
+                "levels": {
+                    "L1": {"model": "gpt-6.2-sol", "effort": "medium"},
+                    "L2": {"model": "gpt-6.2-sol", "effort": "max"},
+                    "L3": {"model": "gpt-6.2-astra", "effort": "high"},
+                    "L4": {"model": "gpt-6.2-astra", "effort": "xhigh"},
+                },
+                "subagent_default": {"model": "inherit", "effort": "inherit"},
+            },
+        )
+        self.assertEqual(
             defaults["executors"]["agy"],
             {
                 "models_ranked": [

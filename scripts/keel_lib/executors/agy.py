@@ -21,6 +21,7 @@ from .base import (
 )
 
 _EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_EPHEMERAL_READ_PRESETS = ("verify", "arbitrate")
 
 
 def _validate_settings(model: str, effort: str | None) -> None:
@@ -42,8 +43,8 @@ class AgyExecutor(ExecutorAdapter):
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
         level, model, effort = resolve_executor_level_config(self.name, req.level, defaults)
-        if req.preset == "verify":
-            enforce_verify_min_level(level, defaults)
+        if req.preset in _EPHEMERAL_READ_PRESETS:
+            enforce_verify_min_level(level, defaults, preset=req.preset)
         if req.agy_workspace != "inherit":
             raise KeelConfigError("Antigravity print mode uses the current workspace. Select a checkout with --worktree.")
         return self._run(req, level, model, effort)
@@ -61,7 +62,7 @@ class AgyExecutor(ExecutorAdapter):
         result_path = req.run_dir / (f"agy-resume-{uuid4().hex}.json" if session_id else "agy-result.json")
         record = {
             "executor": self.name, "level": level, "model": model, "effort": effort,
-            "session_id": session_id, "ephemeral": req.mode == "read" and req.preset == "verify",
+            "session_id": session_id, "ephemeral": req.mode == "read" and req.preset in _EPHEMERAL_READ_PRESETS,
             "output_path": str(req.output_path), "result_path": str(result_path),
         }
         argv = ["agy"]
@@ -135,7 +136,7 @@ class AgyExecutor(ExecutorAdapter):
         model: str | None = None,
         effort: str | None = None,
     ) -> dict[str, Any]:
-        if record.get("ephemeral") or (record["mode"] == "read" and record["preset"] == "verify"):
+        if record.get("ephemeral") or (record["mode"] == "read" and record["preset"] in _EPHEMERAL_READ_PRESETS):
             raise KeelConfigError("Ephemeral Antigravity verification sessions cannot be resumed.")
         session_id = record.get("session_id")
         if not isinstance(session_id, str) or not session_id.strip():
@@ -144,8 +145,8 @@ class AgyExecutor(ExecutorAdapter):
             level, previous_model, previous_effort = record["level"], record["model"], record.get("effort")
         else:
             level, previous_model, previous_effort = resolve_executor_level_config(self.name, level, defaults)
-        if record["preset"] == "verify":
-            enforce_verify_min_level(level, defaults)
+        if record["preset"] in _EPHEMERAL_READ_PRESETS:
+            enforce_verify_min_level(level, defaults, preset=str(record["preset"]))
         req = RunRequest(
             run_id=record["run_id"], run_dir=run_dir, brief_path=followup_path, workdir=Path(record["workdir"]),
             project_root=None, mode=record["mode"], preset=record["preset"], level=level,

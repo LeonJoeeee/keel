@@ -33,12 +33,21 @@ keel agent run --level L2 --executor agy --mode write --preset implement \
 
 `keel worktree list` shows active worktrees. Use `--task-file <file>` for a thorough written specification (no `--why` needed when the spec contains `## Goal & Why` or `## Why`), and pass `--context-file <file>` for supplementary rework or pivot notes without mutating the `main`-locked spec. Continue a resumable run with `keel agent resume <run_id> --message-file <file>` and optionally select a new `--level`.
 
-## Verify and land
+## Verify, arbitrate deadlocks, and land
 
-Verify the clean, committed branch with its deterministic checks. With a recorded write, Keel selects the other vendor at the write level or L2, whichever is higher. Use `--dual` to run both vendors concurrently. Each verifier gets a separate clone and exercises a realistic workflow, including a one-line Canary mutation to check that the tests detect a break. The gate records the verdict on return, steps up rework and verification tiers after a rejection, and enforces a tier-aware convergence cap (`L2(1) -> L3(1) -> L4(2)`—at most 4 rounds from L2, 3 from L3, or 2 from L4).
+Verify the clean, committed branch with its deterministic checks. With a recorded write, Keel selects the other vendor at the write level or L2, whichever is higher. Use `--dual` to run both vendors concurrently. Each verifier gets a separate clone and exercises a realistic workflow, including a one-line Canary mutation to check that the tests detect a break. Round 2+ automatically supplies an unblinded Carry-Forward ledger of prior `blocking` items, commit deltas, and structured author rebuttals (`keel branch dispute`), while keeping full `merge_base..HEAD` inspection open (`--dual` keeps the second verifier clean-slate blind). After a rejection, Keel steps up rework and verification tiers and enforces a tier-aware convergence cap (`L2(1) -> L3(1) -> L4(2)`).
+
+When a slice hits a rebuttal stalemate or the convergence cap, `keel branch arbitrate` (or `branch verify --arbitrate`) runs an impartial `L4` clean-context Arbiter to choose `approve`, `rework_once`, `replan`, `pivot`, or `park`. For `replan` or `pivot`, `keel branch supersede` preserves the retired commit under `refs/keel/superseded/<slug>/...` and propagates dead-end lineage (`--supersedes` or same-slug lookup, bounded by `max_structural_recoveries = 2`) into successor writer briefs.
 
 ```sh
-keel branch verify parser-fix --check "python3 -m unittest discover -s tests"
+keel branch verify parser-fix --arbitrate --check "python3 -m unittest discover -s tests"
+keel branch dispute parser-fix --reason "Empty section input is intentionally normalized upstream"
+keel branch arbitrate parser-fix --check "python3 -m unittest discover -s tests"
+
+# If the Arbiter returns `replan` or `pivot`, retire and preserve the attempt:
+keel branch supersede parser-fix
+
+# If verified or Arbiter-approved, inspect readiness and preview landing:
 keel branch status parser-fix
 keel branch land parser-fix
 ```

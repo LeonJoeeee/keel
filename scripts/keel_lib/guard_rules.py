@@ -575,11 +575,7 @@ def _unwrap_python_keel_invocation(seg: list[str]) -> list[str]:
 
 
 def evaluate_command(
-    command: str,
-    *,
-    mode: str = "main",
-    default_branches: frozenset[str] = DEFAULT_BRANCHES,
-    cwd: str | os.PathLike[str] | None = None,
+    command: str, *, mode: str = "main", default_branches: frozenset[str] = DEFAULT_BRANCHES, cwd: str | os.PathLike[str] | None = None
 ) -> str | None:
     """Return a concrete refusal reason if `command` violates pure-Git safety boundaries, else None."""
     if not command or not command.strip():
@@ -599,9 +595,11 @@ def evaluate_command(
             domain, action, rest = keel_seg[1], keel_seg[2], keel_seg[3:]
             if domain == "branch" and action == "land" and any(r in ("--execute", "--discard") or r.startswith(("--execute=", "--discard=")) for r in rest):
                 return "Subagents cannot execute or discard branches via 'keel branch land'; return to the main session."
+            if domain == "branch" and (action in ("arbitrate", "supersede") or (action == "verify" and any(r == "--arbitrate" or r.startswith("--arbitrate=") for r in rest))):
+                return f"Subagents cannot run 'keel branch {action}' arbitration or supersede; return to the main session."
             if domain == "worktree" and action == "cleanup" and any(r == "--discard" or r.startswith("--discard=") for r in rest):
                 return "Subagents cannot run 'keel worktree cleanup --discard'; return to the main session."
-            if mode == "read" and ((domain == "branch" and action in ("record-verdict", "verify")) or (domain == "worktree" and action in ("create", "cleanup"))):
+            if mode == "read" and ((domain == "branch" and action in ("record-verdict", "verify", "dispute")) or (domain == "worktree" and action in ("create", "cleanup"))):
                 return f"Read-only subagent mode blocks 'keel {domain} {action}'."
         if prog != "git":
             continue

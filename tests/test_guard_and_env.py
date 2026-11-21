@@ -111,9 +111,20 @@ class GuardRulesTests(unittest.TestCase):
                 evaluate_command("python3 -W default /opt/keel/scripts/keel branch land feat --execute", mode=mode)
             )
             self.assertIsNotNone(evaluate_command("keel worktree cleanup feat --discard", mode=mode))
+            self.assertIsNotNone(evaluate_command("keel branch arbitrate feat", mode=mode))
+            self.assertIsNotNone(evaluate_command("keel branch supersede feat", mode=mode))
+            self.assertIsNotNone(evaluate_command("keel branch verify feat --arbitrate", mode=mode))
+            self.assertIsNotNone(
+                evaluate_command("python3 -W default /opt/keel/scripts/keel branch arbitrate feat", mode=mode)
+            )
             # Dry-run `keel branch land` and `keel branch status` are allowed
             self.assertIsNone(evaluate_command("keel branch land feat", mode=mode))
             self.assertIsNone(evaluate_command("keel branch status feat", mode=mode))
+
+        # `write` and `main` allow `keel branch dispute`; `read` blocks it
+        self.assertIsNone(evaluate_command("keel branch dispute feat --reason 'false positive'", mode="write"))
+        self.assertIsNone(evaluate_command("keel branch dispute feat --reason 'false positive'", mode="main"))
+        self.assertIsNotNone(evaluate_command("keel branch dispute feat --reason 'false positive'", mode="read"))
 
         # `read` mode additionally blocks recording verdicts or creating/cleaning worktrees
         self.assertIsNotNone(
@@ -126,6 +137,9 @@ class GuardRulesTests(unittest.TestCase):
         self.assertIsNotNone(evaluate_command("keel worktree create feat", mode="read"))
         self.assertIsNone(evaluate_command("keel branch land feat --execute", mode="main"))
         self.assertIsNone(evaluate_command("keel branch land feat --discard --reason done", mode="main"))
+        self.assertIsNone(evaluate_command("keel branch arbitrate feat", mode="main"))
+        self.assertIsNone(evaluate_command("keel branch supersede feat --archive-task", mode="main"))
+        self.assertIsNone(evaluate_command("keel branch verify feat --arbitrate", mode="main"))
 
     def test_read_mode_blocks_repo_mutations_but_allows_disposable_verify_clone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +319,8 @@ class GuardRulesTests(unittest.TestCase):
     def test_detect_agent_mode_from_public_cwd_and_env(self) -> None:
         self.assertEqual(detect_agent_mode(cwd="/repo/.agents/worktrees/feat-a", env={}), "write")
         self.assertEqual(detect_agent_mode(cwd="/tmp/keel-verify-feat-abc/checkout", env={}), "read")
+        self.assertEqual(detect_agent_mode(cwd="/tmp/keel-verify-arbiter-feat-codex-abc/checkout", env={}), "read")
+        self.assertTrue(is_disposable_verify_path("/tmp/keel-verify-arbiter-feat-codex-abc/checkout"))
         self.assertEqual(detect_agent_mode(cwd="/repo", env={"KEEL_AGENT_MODE": "read"}), "read")
         self.assertEqual(detect_agent_mode(cwd="/repo", env={}), "main")
         line_count = len((ROOT / "scripts" / "keel_lib" / "guard_rules.py").read_text(encoding="utf-8").splitlines())

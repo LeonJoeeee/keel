@@ -24,6 +24,7 @@ from .base import (
 _MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 VALID_CODEX_SANDBOX_MODES = frozenset({"read-only", "workspace-write", "danger-full-access"})
+_EPHEMERAL_READ_PRESETS = ("verify", "arbitrate")
 
 
 def discover_mcp_approval_flags(workdir: Path) -> list[str]:
@@ -185,12 +186,12 @@ class CodexExecutor(ExecutorAdapter):
 
     def execute(self, req: RunRequest, defaults: dict[str, Any]) -> dict[str, Any]:
         level, model, effort = resolve_executor_level_config(self.name, req.level, defaults)
-        if req.preset == "verify":
-            enforce_verify_min_level(level, defaults)
+        if req.preset in _EPHEMERAL_READ_PRESETS:
+            enforce_verify_min_level(level, defaults, preset=req.preset)
         assert effort is not None  # Required by the Codex level mapping
         model = _override(req.model, model)
         effort = _override(req.effort, effort)
-        ephemeral = req.mode == "read" and req.preset == "verify"
+        ephemeral = req.mode == "read" and req.preset in _EPHEMERAL_READ_PRESETS
         argv = self.build_exec_argv(
             workdir=req.workdir,
             mode=req.mode,
@@ -252,7 +253,7 @@ class CodexExecutor(ExecutorAdapter):
         effort: str | None = None,
     ) -> dict[str, Any]:
         if record.get("ephemeral") or (
-            "ephemeral" not in record and record.get("mode") == "read" and record.get("preset") == "verify"
+            "ephemeral" not in record and record.get("mode") == "read" and record.get("preset") in _EPHEMERAL_READ_PRESETS
         ):
             raise KeelConfigError("Ephemeral Codex verification sessions cannot be resumed.")
         session_id = record.get("session_id")
@@ -271,8 +272,8 @@ class CodexExecutor(ExecutorAdapter):
             level_model, level_effort = record["model"], record["effort"]
         else:
             level, level_model, level_effort = resolve_executor_level_config(self.name, level, defaults)
-        if level is not None and record.get("preset") == "verify":
-            enforce_verify_min_level(level, defaults)
+        if level is not None and record.get("preset") in _EPHEMERAL_READ_PRESETS:
+            enforce_verify_min_level(level, defaults, preset=str(record["preset"]))
         assert level_effort is not None
         model = _override(model, level_model)
         effort = _override(effort, level_effort)

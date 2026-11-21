@@ -50,10 +50,10 @@ def escalate_level(level: str) -> str:
     return VALID_LEVELS[min(level_rank(level), len(VALID_LEVELS) - 1)]
 
 
-def enforce_verify_min_level(level: str, defaults: dict[str, Any]) -> None:
+def enforce_verify_min_level(level: str, defaults: dict[str, Any], *, preset: str = "verify") -> None:
     minimum = normalize_level(defaults.get("verify_min_level"))
     if level_rank(level) < level_rank(minimum):
-        raise KeelConfigError(f"The verify preset requires --level {minimum} or higher, got {level}.")
+        raise KeelConfigError(f"The {preset} preset requires --level {minimum} or higher, got {level}.")
 
 
 def resolve_executor_level_config(

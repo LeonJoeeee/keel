@@ -16,6 +16,16 @@ from .env import is_subpath
 from .worktree import ROOT_AGENT_DOCS
 
 WHY_HEADINGS: tuple[str, ...] = ("Goal & Why", "Why")
+REVIEW_HISTORY_HEADING_SUBSTRINGS: tuple[str, ...] = (
+    "prior review",
+    "review carry-forward",
+    "review carry forward",
+    "review ledger",
+    "review rebuttal",
+    "author rebuttal",
+    "technical rebuttal",
+    "disputed finding",
+)
 _BQ_PREFIX_RE = re.compile(r"^ {0,3}> ?")
 _THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:- *){3,}|(?:\* *){3,}|(?:_ *){3,})$")
 _SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+) *$")
@@ -141,7 +151,8 @@ def _parse_markdown_sections(
     if markdown.startswith("\ufeff"):
         markdown = markdown[1:]
     lines = markdown.splitlines()
-    headings_found: list[tuple[int, int, str]] = []
+    headings_found: list[tuple[int, int, str, int]] = []
+    container_end_by_pos: dict[int, int] = {}
     # Active CommonMark containers: ("bq", 0, False) or ("list", indent_delta, started_empty)
     containers: list[tuple[str, int, bool]] = []
     # Open code fence: (container_depth, fence_char, fence_len)
@@ -218,6 +229,9 @@ def _parse_markdown_sections(
                 continue
 
         if matched_depth < len(containers):
+            for h_pos, (_, _, _, h_depth) in enumerate(headings_found):
+                if h_depth > matched_depth and h_pos not in container_end_by_pos:
+                    container_end_by_pos[h_pos] = idx
             containers = containers[:matched_depth]
             in_paragraph = False
             if fence is not None and matched_depth < fence[0]:
@@ -308,16 +322,18 @@ def _parse_markdown_sections(
             if not (top_level_only and containers):
                 level = len(head_m.group(1))
                 raw_title = re.sub(r"(?:^| +)#+$", "", head_m.group(2) or "").strip()
-                headings_found.append((idx, level, raw_title))
+                headings_found.append((idx, level, raw_title, len(containers)))
             continue
 
         in_paragraph = True
 
     sections: list[tuple[int, str, str, int, int]] = []
-    for pos, (start_idx, level, title) in enumerate(headings_found):
-        end_idx = len(lines)
-        for next_idx, next_level, _ in headings_found[pos + 1 :]:
-            if next_level <= level:
+    for pos, (start_idx, level, title, depth) in enumerate(headings_found):
+        end_idx = container_end_by_pos.get(pos, len(lines))
+        for next_idx, next_level, _, next_depth in headings_found[pos + 1 :]:
+            if next_idx >= end_idx:
+                break
+            if next_depth < depth or (next_depth == depth and next_level <= level):
                 end_idx = next_idx
                 break
         body = trim_markdown_block("\n".join(lines[start_idx + 1 : end_idx]))
@@ -344,17 +360,60 @@ def extract_markdown_section(
     return None
 
 
+def _strip_markdown_sections(markdown: str, exclude_headings: Sequence[str]) -> str:
+    """Strip ATX heading sections (and any nested subsections) whose normalized title matches `exclude_headings`."""
+    excluded = {_normalize_heading(h) for h in exclude_headings if h and h.strip()}
+    if not markdown or not excluded:
+        return markdown
+    clean_md = markdown[1:] if markdown.startswith("\ufeff") else markdown
+    spans = [
+        (start_idx, end_idx)
+        for _, title, _, start_idx, end_idx in _parse_markdown_sections(clean_md)
+        if _normalize_heading(title) in excluded
+    ]
+    if not spans:
+        return markdown
+    lines = clean_md.splitlines()
+    kept = [line for idx, line in enumerate(lines) if not any(s <= idx < e for s, e in spans)]
+    return "\n".join(kept)
+
+
+def strip_review_history_sections(markdown: str) -> str:
+    """Strip ATX sections whose heading title names prior review, carry-forward, or rebuttal history."""
+    if not markdown or not markdown.strip():
+        return ""
+    clean_md = markdown[1:] if markdown.startswith("\ufeff") else markdown
+    spans = [
+        (start_idx, end_idx)
+        for _, title, _, start_idx, end_idx in _parse_markdown_sections(clean_md, top_level_only=False)
+        if any(tok in _normalize_heading(title) for tok in REVIEW_HISTORY_HEADING_SUBSTRINGS)
+    ]
+    if not spans:
+        return trim_markdown_block(clean_md)
+    lines = clean_md.splitlines()
+    kept = [line for idx, line in enumerate(lines) if not any(s <= idx < e for s, e in spans)]
+    return trim_markdown_block("\n".join(kept))
+
+
 def extract_changed_markdown_sections(
     base_markdown: str,
     head_markdown: str,
     headings: Sequence[str],
     *,
     levels: Sequence[int] | None = (2, 3),
+    exclude_headings: Sequence[str] = (),
 ) -> str | None:
     """Extract non-empty matching sections from `head_markdown` whose bodies differ from `base_markdown`."""
-    targets = {_normalize_heading(h) for h in headings if h and h.strip()}
+    excluded = {_normalize_heading(h) for h in exclude_headings if h and h.strip()}
+    targets = {_normalize_heading(h) for h in headings if h and h.strip()} - excluded
     if not head_markdown or not targets:
         return None
+    if excluded:
+        if base_markdown:
+            base_markdown = _strip_markdown_sections(base_markdown, exclude_headings)
+        head_markdown = _strip_markdown_sections(head_markdown, exclude_headings)
+        if not head_markdown:
+            return None
     allowed_levels = set(levels) if levels is not None else None
 
     base_bodies: dict[str, set[str]] = {}

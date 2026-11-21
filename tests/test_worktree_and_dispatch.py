@@ -155,6 +155,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         defaults = load_defaults()
         levels = ["L1", "L2", "L3", "L4"]
         self.assertEqual(defaults["levels"], levels)
+        self.assertEqual(defaults["max_structural_recoveries"], 2)
         self.assertEqual(defaults["routing"], {"general": "agy", "implement": "agy", "verify": "codex"})
         self.assertEqual(
             defaults["executors"]["codex"],
@@ -378,6 +379,21 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             self.assertIn("ephemeral", cli(*resume, status=2).lower())
             self.assertEqual(record_path.read_bytes(), original)
             self.assertTrue(verify["ephemeral"])
+
+            # `preset="arbitrate"` enforces `verify_min_level` and runs as a non-resumable ephemeral session
+            self.assertIn("level", cli(*run, "--preset", "arbitrate", "--level", "L1", status=2).lower())
+            self.assertIn("level", cli(*run, "--preset", "arbitrate", "--executor", "agy", "--level", "L1", status=2).lower())
+            arb_codex = cli(*run, "--preset", "arbitrate", "--level", "L4", "--enforce-verdict-schema")
+            self.assertEqual(arb_codex["executor"], "codex")
+            self.assertTrue(arb_codex["ephemeral"])
+            self.assertTrue(arb_codex["output_path"].endswith("arbiter.json"))
+            self.assertTrue(str(arb_codex["schema_path"]).endswith("arbiter.schema.json"))
+            self.assertIn("--ephemeral", json.loads(Path(arb_codex["output_path"]).read_text()))
+            self.assertIn("ephemeral", cli(*resume, status=2).lower())
+
+            arb_agy = cli(*run, "--preset", "arbitrate", "--executor", "agy", "--level", "L4")
+            self.assertTrue(arb_agy["ephemeral"])
+            self.assertIn("ephemeral", cli(*resume, status=2).lower())
 
     def test_agy_synchronous_argv_and_native_json(self) -> None:
         defaults = load_defaults()
@@ -1753,6 +1769,62 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 )
                 self.assertEqual(repo_guard.returncode, 2)
             self.assertFalse((ROOT / "sub").exists())
+
+    def test_disjoint_custom_branch_lineage_paths_and_domain_carryforward_stripping(self) -> None:
+        from keel_lib.context import strip_review_history_sections
+        from keel_lib.worktree import lineage_state_path, resolve_supersedes_lineage, save_lineage_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            common_dir = Path(tmp) / ".git"
+            task_p = lineage_state_path(common_dir, "task/parser")
+            flat_p = lineage_state_path(common_dir, "parser")
+            pref_p = lineage_state_path(common_dir, "fix/parser")
+            nested_task_p = lineage_state_path(common_dir, "task/sub/parser")
+            self.assertEqual(task_p.name, "parser.json")
+            self.assertEqual(flat_p.name, "custom+parser.json")
+            self.assertEqual(pref_p.name, "custom+fix%2Fparser.json")
+            self.assertEqual(nested_task_p.name, "custom+task%2Fsub%2Fparser.json")
+            self.assertEqual(len({task_p, flat_p, pref_p, nested_task_p}), 4)
+
+            save_lineage_state(
+                common_dir,
+                "task/parser",
+                {"slug": "parser", "branch": "task/parser", "recovery_count": 1, "prior_directives": ["TASK_D"]},
+            )
+            save_lineage_state(
+                common_dir,
+                "parser",
+                {"slug": "parser", "branch": "parser", "recovery_count": 2, "prior_directives": ["FLAT_D"]},
+            )
+            self.assertEqual(resolve_supersedes_lineage(common_dir, "task/parser")["prior_directives"], ["TASK_D"])
+            self.assertEqual(resolve_supersedes_lineage(common_dir, "parser")["prior_directives"], ["TASK_D"])
+            self.assertEqual(resolve_supersedes_lineage(common_dir, "refs/heads/parser")["prior_directives"], ["FLAT_D"])
+
+            # When `task/<slug>` has no lineage, bare `<slug>` falls back to flat custom branch `custom+<slug>.json`
+            save_lineage_state(
+                common_dir,
+                "solo-flat",
+                {"slug": "solo-flat", "branch": "solo-flat", "recovery_count": 1, "prior_directives": ["SOLO_FLAT_D"]},
+            )
+            self.assertEqual(resolve_supersedes_lineage(common_dir, "solo-flat")["prior_directives"], ["SOLO_FLAT_D"])
+
+        domain_md = (
+            "# Tax loss carry-forward\n\n"
+            "Cap ordinary offset at $3,000.\n\n"
+            "## Carry forward schedule\n\n"
+            "Track short-term vs long-term buckets.\n\n"
+            "### Prior Review Carry-Forward Ledger\n\n"
+            "Internal Round 1 blocker.\n\n"
+            "### Review Ledger\n\n"
+            "Internal ledger summary.\n"
+        )
+        cleaned = strip_review_history_sections(domain_md)
+        self.assertIn("# Tax loss carry-forward", cleaned)
+        self.assertIn("Cap ordinary offset at $3,000.", cleaned)
+        self.assertIn("## Carry forward schedule", cleaned)
+        self.assertIn("Track short-term vs long-term buckets.", cleaned)
+        self.assertNotIn("Internal Round 1 blocker.", cleaned)
+        self.assertNotIn("Internal ledger summary.", cleaned)
 
 
 if __name__ == "__main__":

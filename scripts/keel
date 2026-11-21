@@ -16,12 +16,16 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from keel_lib import KeelError, SCHEMAS_DIR, load_defaults  # noqa: E402
 from keel_lib.branch_gate import (  # noqa: E402
+    arbitrate_branch,
     branch_repo_overview,
+    build_branch_lineage_context,
     compare_rebase,
+    dispute_branch,
     evaluate_branch_gate,
     land_branch,
     prepare_branch_write,
     record_branch_write,
+    supersede_branch,
     verify_branch,
 )
 from keel_lib.context import (  # noqa: E402
@@ -47,9 +51,12 @@ from keel_lib.worktree import (  # noqa: E402
     cleanup_worktree,
     create_worktree,
     ensure_agents_dir_ignored,
+    git_dirs,
     git_toplevel,
     list_worktrees,
+    resolve_supersedes_lineage,
     validate_slug,
+    validate_supersedes_target,
 )
 
 
@@ -79,6 +86,7 @@ def _cmd_worktree_create(args: argparse.Namespace) -> dict[str, Any]:
         base=args.base,
         branch=args.branch,
         fetch=args.fetch,
+        supersedes=args.supersedes,
     )
 
 
@@ -104,10 +112,13 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     defaults = load_defaults()
     preset = args.preset
     norm_level = normalize_level(args.level)
-    if preset == "verify":
-        enforce_verify_min_level(norm_level, defaults)
+    if preset in ("verify", "arbitrate"):
+        enforce_verify_min_level(norm_level, defaults, preset=preset)
     mode = args.mode or ("write" if preset == "implement" else "read")
-    executor_name = args.executor or defaults.get("routing", {}).get(preset, "codex")
+    routing = defaults.get("routing", {})
+    executor_name = args.executor or routing.get(preset) or (
+        routing.get("verify", "codex") if preset == "arbitrate" else "codex"
+    )
     adapter = get_executor(executor_name)
 
     task_text = _read_text_file(args.task_file, "--task-file") if args.task_file else (args.task or "")
@@ -122,6 +133,12 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
 
     caller_cwd = safe_resolve(Path.cwd())
     project_root = _resolve_project_root(args.project)
+    if args.supersedes is not None:
+        validate_supersedes_target(args.supersedes)
+        if project_root is None:
+            raise KeelError("--supersedes requires running inside or pointing --project at a Git repository.")
+        common_dir, _ = git_dirs(project_root)
+        resolve_supersedes_lineage(common_dir, args.supersedes)
     if project_root is not None:
         ensure_agents_dir_ignored(project_root)
 
@@ -131,7 +148,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         slug = validate_slug(args.worktree)
         wt_dir = project_root / ".agents" / "worktrees" / slug
         if not wt_dir.is_dir():
-            create_worktree(project_root, slug, base=args.base)
+            create_worktree(project_root, slug, base=args.base, supersedes=args.supersedes)
         workdir = wt_dir
     elif args.cwd:
         workdir = safe_resolve(args.cwd)
@@ -140,16 +157,22 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     else:
         workdir = caller_cwd
 
+    lineage_ctx = build_branch_lineage_context(workdir, mode, defaults, supersedes=args.supersedes)
+    if lineage_ctx:
+        extra_context = f"{extra_context.rstrip()}\n\n{lineage_ctx}" if (extra_context and extra_context.strip()) else lineage_ctx
+
     write_target = prepare_branch_write(workdir, mode, norm_level, defaults)
 
     run_id = args.run_id or generate_run_id(preset)
     run_dir = runs_root_dir(project_root, Path(tempfile.gettempdir())) / run_id
 
     schema_path = safe_resolve(args.schema) if args.schema else (
-        (SCHEMAS_DIR / "verdict.schema.json") if preset == "verify" and args.enforce_verdict_schema else None
+        (SCHEMAS_DIR / ("arbiter.schema.json" if preset == "arbitrate" else "verdict.schema.json"))
+        if preset in ("verify", "arbitrate") and args.enforce_verdict_schema
+        else None
     )
     output_path = safe_resolve(args.output) if args.output else (
-        run_dir / ("verdict.json" if schema_path else "output.md")
+        run_dir / (("arbiter.json" if preset == "arbitrate" else "verdict.json") if schema_path else "output.md")
     )
     brief_path = run_dir / "brief.md"
 
@@ -206,8 +229,8 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
     adapter = get_executor(record["executor"])
     level = normalize_level(args.level) if args.level is not None else None
     effective_level = level or record.get("level")
-    if effective_level is not None and record.get("preset") == "verify":
-        enforce_verify_min_level(effective_level, defaults)
+    if effective_level is not None and record.get("preset") in ("verify", "arbitrate"):
+        enforce_verify_min_level(effective_level, defaults, preset=str(record["preset"]))
 
     write_target = prepare_branch_write(Path(record["workdir"]), record["mode"], effective_level, defaults)
     msg = _read_text_file(args.message_file, "--message-file") if args.message_file else (args.message or "")
@@ -244,8 +267,11 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _cmd_branch_verify(args: argparse.Namespace) -> dict[str, Any]:
-    if _effective_caller_mode(args.project) == "read":
+    caller_mode = _effective_caller_mode(args.project)
+    if caller_mode == "read":
         raise KeelError("Read-only subagent mode cannot run `keel branch verify`.")
+    if args.arbitrate and caller_mode in ("read", "write"):
+        raise KeelError("Subagents cannot run arbitration via `keel branch verify --arbitrate`; return to the main session.")
     defaults = load_defaults()
     proj = git_toplevel(args.project or Path.cwd())
     return verify_branch(
@@ -265,6 +291,67 @@ def _cmd_branch_verify(args: argparse.Namespace) -> dict[str, Any]:
         context_file=args.context_file,
         output_dir=args.output_dir,
         force_round=args.force_round,
+        auto_arbitrate=args.arbitrate,
+        caller_cwd=safe_resolve(Path.cwd()),
+    )
+
+
+def _cmd_branch_dispute(args: argparse.Namespace) -> dict[str, Any]:
+    if _effective_caller_mode(args.project) == "read":
+        raise KeelError("Read-only subagent mode cannot run `keel branch dispute`.")
+    if args.reason is not None and args.reason_file is not None:
+        raise KeelError("Cannot combine --reason and --reason-file.")
+    raw_reason = _read_text_file(args.reason_file, "--reason-file") if args.reason_file else (args.reason or "")
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    return dispute_branch(
+        proj,
+        args.branch,
+        reason=raw_reason,
+        base=args.base,
+        defaults=defaults,
+    )
+
+
+def _cmd_branch_arbitrate(args: argparse.Namespace) -> dict[str, Any]:
+    if _effective_caller_mode(args.project) in ("read", "write"):
+        raise KeelError("Subagents cannot run `keel branch arbitrate`; return to the main session.")
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    return arbitrate_branch(
+        project=proj,
+        branch_or_slug=args.branch,
+        defaults=defaults,
+        base=args.base,
+        executor=args.executor,
+        level=args.level,
+        model=args.model,
+        effort=args.effort,
+        checks=args.check or (),
+        skip_checks=args.skip_checks,
+        task_file_arg=args.task_file,
+        why=args.why,
+        context_file=args.context_file,
+        output_dir=args.output_dir,
+        force_round=args.force_round,
+        caller_cwd=safe_resolve(Path.cwd()),
+    )
+
+
+def _cmd_branch_supersede(args: argparse.Namespace) -> dict[str, Any]:
+    if _effective_caller_mode(args.project) in ("read", "write"):
+        raise KeelError("Subagents cannot run `keel branch supersede`; return to the main session.")
+    defaults = load_defaults()
+    proj = git_toplevel(args.project or Path.cwd())
+    return supersede_branch(
+        project=proj,
+        branch_or_slug=args.branch,
+        defaults=defaults,
+        base=args.base,
+        reason=args.reason,
+        archive_task=args.archive_task,
+        keep_branch=args.keep_branch,
+        task_file_arg=args.task_file,
         caller_cwd=safe_resolve(Path.cwd()),
     )
 
@@ -347,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     wt_c.add_argument("--base", default="main")
     wt_c.add_argument("--branch")
     wt_c.add_argument("--fetch", action="store_true", help="Fetch remote base ref before creating worktree.")
+    wt_c.add_argument("--supersedes", help="Inherit structural recovery lineage and dead ends from a superseded slug.")
     wt_c.set_defaults(func=_cmd_worktree_create)
 
     wt_l = wt_sub.add_parser("list", help="List git worktrees.")
@@ -372,7 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     ag_r.add_argument("--task", help="Task goal, scope boundaries, and done criteria.")
     ag_r.add_argument("--task-file", help="Read task specification from file.")
     ag_r.add_argument("--context-file", help="Optional supplementary context file (e.g., rework or pivot notes).")
-    ag_r.add_argument("--preset", default="general", help="Context preset name (general, implement, verify).")
+    ag_r.add_argument("--preset", default="general", help="Context preset name (general, implement, verify, arbitrate).")
     ag_r.add_argument("--mode", choices=["read", "write"], help="Sandbox/workspace mode.")
     ag_r.add_argument("--executor", choices=sorted(EXECUTORS), help="Side-agent executor adapter.")
     ag_r.add_argument("--level", metavar="L1|L2|L3|L4", help="Required task intensity level.")
@@ -381,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     ag_r.add_argument("--project")
     ag_r.add_argument("--worktree", help="Create/use .agents/worktrees/<slug>.")
     ag_r.add_argument("--base", default="main")
+    ag_r.add_argument("--supersedes", help="Inherit structural recovery lineage and dead ends from a superseded slug.")
     ag_r.add_argument("--cwd")
     ag_r.add_argument("--schema", help="Optional JSON Schema file path.")
     ag_r.add_argument("--enforce-verdict-schema", action="store_true")
@@ -419,11 +508,61 @@ def build_parser() -> argparse.ArgumentParser:
     br_v.add_argument("--context-file")
     br_v.add_argument("--output-dir")
     br_v.add_argument(
+        "--arbitrate",
+        action="store_true",
+        help="Automatically invoke the L4 Arbiter if this round ends in a convergence-cap or rebuttal deadlock.",
+    )
+    br_v.add_argument(
         "--force-round",
         action="store_true",
         help="Only for explicit human-authorized escalations after hitting the convergence cap.",
     )
     br_v.set_defaults(func=_cmd_branch_verify)
+
+    br_disp = br_sub.add_parser("dispute", help="Record an evidence-backed writer rebuttal against an active rejection.")
+    br_disp.add_argument("branch")
+    br_disp.add_argument("--reason", help="Technical rebuttal explaining why the disputed finding is false or out of bounds.")
+    br_disp.add_argument("--reason-file", help="Read UTF-8 rebuttal text from file.")
+    br_disp.add_argument("--base")
+    br_disp.add_argument("--project")
+    br_disp.set_defaults(func=_cmd_branch_dispute)
+
+    br_arb = br_sub.add_parser(
+        "arbitrate",
+        help="Run impartial top-tier (L4) clean-context arbitration on a deadlocked or capped branch.",
+    )
+    br_arb.add_argument("branch")
+    br_arb.add_argument("--project")
+    br_arb.add_argument("--base")
+    br_arb.add_argument("--executor", choices=sorted(EXECUTORS))
+    br_arb.add_argument("--level", metavar="L1|L2|L3|L4")
+    br_arb.add_argument("--model")
+    br_arb.add_argument("--effort")
+    br_arb.add_argument("--check", action="append", default=[])
+    br_arb.add_argument("--skip-checks")
+    br_arb.add_argument("--task-file")
+    br_arb.add_argument("--why")
+    br_arb.add_argument("--context-file")
+    br_arb.add_argument("--output-dir")
+    br_arb.add_argument(
+        "--force-round",
+        action="store_true",
+        help="Only for explicit human-authorized re-arbitration of a parked branch.",
+    )
+    br_arb.set_defaults(func=_cmd_branch_arbitrate)
+
+    br_sup = br_sub.add_parser(
+        "supersede",
+        help="Safely retire an Arbiter-directed replan/pivot branch while preserving Git ref and dead-end lineage.",
+    )
+    br_sup.add_argument("branch")
+    br_sup.add_argument("--project")
+    br_sup.add_argument("--base")
+    br_sup.add_argument("--reason", help="Optional Orchestrator note recorded alongside the Arbiter summary.")
+    br_sup.add_argument("--task-file", help="Validate explicit task file against the Arbiter decision.")
+    br_sup.add_argument("--archive-task", action="store_true", help="Archive active/todo task file on base ref.")
+    br_sup.add_argument("--keep-branch", action="store_true")
+    br_sup.set_defaults(func=_cmd_branch_supersede)
 
     br_st = br_sub.add_parser("status", help="Inspect repo-wide task/worktree overview or a branch's gate status.")
     br_st.add_argument("branch", nargs="?")

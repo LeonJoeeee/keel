@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "summary",
+    "directives",
+    "avoid_dead_ends",
+    "waived_findings",
+    "commands_run"
+  ],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["approve", "rework_once", "replan", "pivot", "park"],
+      "description": "Impartial deadlock resolution: 'approve' waives non-blocking/false-positive findings; 'rework_once' grants one surgical L4 fix round; 'replan' retires the branch to split/re-sequence tasks; 'pivot' retires the branch for a clean rewrite from base; 'park' halts strictly for genuine human tradeoffs, external blockers, or exhausted recoveries."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Concise factual synthesis of the technical adjudication grounded in the user's Core need, Design Philosophy, and locked task criteria."
+    },
+    "directives": {
+      "type": "array",
+      "description": "Concrete instructions for the Orchestrator, writer, or human decision. Required (non-empty) whenever action is 'rework_once', 'replan', 'pivot', or 'park'.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "avoid_dead_ends": {
+      "type": "array",
+      "description": "Failed technical approaches or traps from this attempt that successor slices must not repeat.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "waived_findings": {
+      "type": "array",
+      "description": "Specific disputed verifier findings overruled as false positives, out-of-bounds, or non-blocking polish, with technical rationale.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "commands_run": {
+      "type": "array",
+      "description": "Deterministic checks and empirical probes executed in the disposable clone during arbitration.",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    }
+  }
+}

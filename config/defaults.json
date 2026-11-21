@@ -1,6 +1,7 @@
 {
   "default_branches": ["main", "master"],
   "max_review_rounds": 2,
+  "max_structural_recoveries": 2,
   "levels": ["L1", "L2", "L3", "L4"],
   "verify_min_level": "L2",
   "routing": {

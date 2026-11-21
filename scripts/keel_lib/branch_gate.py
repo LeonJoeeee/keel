@@ -17,7 +17,15 @@ from . import KeelError, SCHEMAS_DIR
 from .context import assemble_brief, generate_run_id, runs_root_dir, save_run_record
 from .env import check_interrupted, forward_signals_to_child_groups, run_cmd, safe_resolve, same_path, tool_env
 from .executors import RunRequest, get_executor
-from .executors.base import KeelConfigError, KeelExecutionError, escalate_level, level_rank, max_level, normalize_level
+from .executors.base import (
+    KeelConfigError,
+    KeelExecutionError,
+    VALID_LEVELS,
+    escalate_level,
+    level_rank,
+    max_level,
+    normalize_level,
+)
 from .worktree import (
     cleanup_worktree,
     create_disposable_clone,
@@ -106,6 +114,113 @@ def _sanitized_git_nul(repo_dir: Path, args: list[str]) -> list[str]:
     return [item for item in proc.stdout.split("\0") if item]
 
 
+def _prove_rebase_in_clean_repo(
+    clean_repo: Path,
+    old_base: str,
+    old_head: str,
+    new_base: str,
+    new_head: str,
+) -> dict[str, Any]:
+    for anc, desc, desc_label in (
+        (old_base, old_head, "old-base <= old-head"),
+        (old_base, new_base, "old-base <= new-base"),
+        (new_base, new_head, "new-base <= new-head"),
+    ):
+        chk = run_cmd(
+            ["git", "merge-base", "--is-ancestor", anc, desc],
+            cwd=clean_repo,
+            env=_sanitized_git_env(),
+            check=False,
+        )
+        if chk.returncode != 0:
+            raise KeelError(f"Pure-rebase ancestry precondition failed: {desc_label}.")
+
+    if _sanitized_git(clean_repo, ["rev-list", "--merges", f"{old_base}..{old_head}"]) or _sanitized_git(
+        clean_repo, ["rev-list", "--merges", f"{new_base}..{new_head}"]
+    ):
+        raise KeelError("Pure-rebase proof rejects ranges containing merge commits.")
+
+    old_diff_files = _sanitized_git_nul(clean_repo, ["diff", "--name-only", "-z", old_base, old_head])
+    if not old_diff_files:
+        raise KeelError("Old range has an empty diff.")
+
+    touched = set(old_diff_files)
+    touched.update(_sanitized_git_nul(clean_repo, ["diff", "--name-only", "-z", old_base, new_base]))
+
+    lit_paths = [f":(literal){p}" for p in sorted(touched)]
+    for rev in (old_base, old_head, new_base, new_head):
+        ls_entries = _sanitized_git_nul(clean_repo, ["ls-tree", "-z", rev, "--", *lit_paths])
+        if any(entry.startswith("160000 ") for entry in ls_entries):
+            raise KeelError("Pure-rebase proof does not admit submodule gitlink changes.")
+        attr_tokens = _sanitized_git_nul(
+            clean_repo,
+            ["check-attr", "-z", "--source", rev, "merge", "--", *sorted(touched)],
+        )
+        for idx in range(0, len(attr_tokens) - 2, 3):
+            merge_attr = attr_tokens[idx + 2].strip()
+            if merge_attr not in SAFE_MERGE_ATTRS:
+                raise KeelError(
+                    f"Pure-rebase proof rejects custom .gitattributes merge driver '{merge_attr}'."
+                )
+
+    target_tree = _sanitized_git(clean_repo, ["rev-parse", f"{new_head}^{{tree}}"])
+
+    mt = run_cmd(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "rerere.enabled=false",
+            "merge-tree",
+            "--write-tree",
+            f"--merge-base={old_base}",
+            new_base,
+            old_head,
+        ],
+        cwd=clean_repo,
+        env=_sanitized_git_env(),
+        check=False,
+    )
+    if mt.returncode == 0 and mt.stdout.strip().splitlines()[0].strip() == target_tree:
+        return {"ok": True, "method": "merge-tree", "tree_sha": target_tree}
+
+    run_cmd(["git", "checkout", "--quiet", "--detach", old_head], cwd=clean_repo, env=_sanitized_git_env())
+    rb = run_cmd(
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "rerere.enabled=false",
+            "-c",
+            "user.name=Keel Rebase Proof",
+            "-c",
+            "user.email=keel@localhost",
+            "rebase",
+            "--no-autostash",
+            "--no-gpg-sign",
+            "--reapply-cherry-picks",
+            "--empty=keep",
+            "--onto",
+            new_base,
+            old_base,
+        ],
+        cwd=clean_repo,
+        env=_sanitized_git_env(),
+        check=False,
+    )
+    if rb.returncode != 0:
+        raise KeelError("Rebase replay encountered conflicts; fresh independent verification is required.")
+    replay_tree = _sanitized_git(clean_repo, ["rev-parse", "HEAD^{tree}"])
+    if replay_tree != target_tree:
+        raise KeelError(
+            f"Rebased head tree ({target_tree[:12]}) differs from pure replay tree ({replay_tree[:12]}); "
+            "fresh independent verification is required."
+        )
+    return {"ok": True, "method": "rebase-replay", "tree_sha": target_tree}
+
+
 def compare_rebase(
     project: Path,
     old_base: str,
@@ -131,105 +246,7 @@ def compare_rebase(
         alt_file = clean_repo / ".git" / "objects" / "info" / "alternates"
         alt_file.parent.mkdir(parents=True, exist_ok=True)
         alt_file.write_text(f"{objects_dir}\n", encoding="utf-8")
-
-        for anc, desc, desc_label in (
-            (old_base, old_head, "old-base <= old-head"),
-            (old_base, new_base, "old-base <= new-base"),
-            (new_base, new_head, "new-base <= new-head"),
-        ):
-            chk = run_cmd(
-                ["git", "merge-base", "--is-ancestor", anc, desc],
-                cwd=clean_repo,
-                env=_sanitized_git_env(),
-                check=False,
-            )
-            if chk.returncode != 0:
-                raise KeelError(f"Pure-rebase ancestry precondition failed: {desc_label}.")
-
-        if _sanitized_git(clean_repo, ["rev-list", "--merges", f"{old_base}..{old_head}"]) or _sanitized_git(
-            clean_repo, ["rev-list", "--merges", f"{new_base}..{new_head}"]
-        ):
-            raise KeelError("Pure-rebase proof rejects ranges containing merge commits.")
-
-        old_diff_files = _sanitized_git_nul(clean_repo, ["diff", "--name-only", "-z", old_base, old_head])
-        if not old_diff_files:
-            raise KeelError("Old range has an empty diff.")
-
-        touched = set(old_diff_files)
-        touched.update(_sanitized_git_nul(clean_repo, ["diff", "--name-only", "-z", old_base, new_base]))
-
-        lit_paths = [f":(literal){p}" for p in sorted(touched)]
-        for rev in (old_base, old_head, new_base, new_head):
-            ls_entries = _sanitized_git_nul(clean_repo, ["ls-tree", "-z", rev, "--", *lit_paths])
-            if any(entry.startswith("160000 ") for entry in ls_entries):
-                raise KeelError("Pure-rebase proof does not admit submodule gitlink changes.")
-            attr_tokens = _sanitized_git_nul(
-                clean_repo,
-                ["check-attr", "-z", "--source", rev, "merge", "--", *sorted(touched)],
-            )
-            for idx in range(0, len(attr_tokens) - 2, 3):
-                merge_attr = attr_tokens[idx + 2].strip()
-                if merge_attr not in SAFE_MERGE_ATTRS:
-                    raise KeelError(
-                        f"Pure-rebase proof rejects custom .gitattributes merge driver '{merge_attr}'."
-                    )
-
-        target_tree = _sanitized_git(clean_repo, ["rev-parse", f"{new_head}^{{tree}}"])
-
-        mt = run_cmd(
-            [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "rerere.enabled=false",
-                "merge-tree",
-                "--write-tree",
-                f"--merge-base={old_base}",
-                new_base,
-                old_head,
-            ],
-            cwd=clean_repo,
-            env=_sanitized_git_env(),
-            check=False,
-        )
-        if mt.returncode == 0 and mt.stdout.strip().splitlines()[0].strip() == target_tree:
-            return {"ok": True, "method": "merge-tree", "tree_sha": target_tree}
-
-        run_cmd(["git", "checkout", "--quiet", "--detach", old_head], cwd=clean_repo, env=_sanitized_git_env())
-        rb = run_cmd(
-            [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "rerere.enabled=false",
-                "-c",
-                "user.name=Keel Rebase Proof",
-                "-c",
-                "user.email=keel@localhost",
-                "rebase",
-                "--no-autostash",
-                "--no-gpg-sign",
-                "--reapply-cherry-picks",
-                "--empty=keep",
-                "--onto",
-                new_base,
-                old_base,
-            ],
-            cwd=clean_repo,
-            env=_sanitized_git_env(),
-            check=False,
-        )
-        if rb.returncode != 0:
-            raise KeelError("Rebase replay encountered conflicts; fresh independent verification is required.")
-        replay_tree = _sanitized_git(clean_repo, ["rev-parse", "HEAD^{tree}"])
-        if replay_tree != target_tree:
-            raise KeelError(
-                f"Rebased head tree ({target_tree[:12]}) differs from pure replay tree ({replay_tree[:12]}); "
-                "fresh independent verification is required."
-            )
-        return {"ok": True, "method": "rebase-replay", "tree_sha": target_tree}
+        return _prove_rebase_in_clean_repo(clean_repo, old_base, old_head, new_base, new_head)
 
 
 def resolve_branch_and_slug(project: Path, branch_or_slug: str, *, must_exist: bool = True) -> tuple[str, str]:
@@ -489,12 +506,368 @@ def _record_skipped_checks(common_dir: Path, branch: str, head_sha: str, reason:
         }
 
 
-def _rework_floor(rounds: list[dict[str, Any]]) -> str | None:
-    if not rounds or rounds[-1]["outcome"] != "request_changes":
-        return None
-    latest = rounds[-1]
+def _resolve_ladder(
+    levels: Sequence[str] | None = None,
+    verify_min_level: str | None = None,
+) -> tuple[str, list[str]]:
+    raw_levels = tuple(levels) if levels else VALID_LEVELS
+    ordered = sorted({normalize_level(lvl) for lvl in raw_levels}, key=level_rank)
+    if not ordered:
+        ordered = list(VALID_LEVELS)
+    min_lvl = normalize_level(verify_min_level or "L2")
+    verify_tiers = [lvl for lvl in ordered if level_rank(lvl) >= level_rank(min_lvl)]
+    if not verify_tiers:
+        verify_tiers = [ordered[-1]]
+    return verify_tiers[-1], verify_tiers
+
+
+def _escalate_in_ladder(level: str, levels: Sequence[str] | None = None) -> str:
+    norm = normalize_level(level)
+    raw_levels = tuple(levels) if levels else VALID_LEVELS
+    ordered = sorted({normalize_level(lvl) for lvl in raw_levels}, key=level_rank)
+    if not ordered:
+        return escalate_level(norm)
+    cur_rank = level_rank(norm)
+    if level_rank(ordered[-1]) < cur_rank:
+        raise KeelConfigError(
+            f"Required tier {norm} exceeds configured levels (max {ordered[-1]})."
+        )
+    for lvl in ordered:
+        if level_rank(lvl) > cur_rank:
+            return lvl
+    return ordered[-1]
+
+
+def _manual_baseline_level(verify_tiers: Sequence[str]) -> str:
+    return "L3" if "L3" in verify_tiers else verify_tiers[-1]
+
+
+def _ceil_in_tiers(level: str, tiers: Sequence[str]) -> str:
+    norm = normalize_level(level)
+    target = level_rank(norm)
+    for tier in tiers:
+        if level_rank(tier) >= target:
+            return tier
+    raise KeelConfigError(
+        f"Verification requires --level {norm} or higher, "
+        f"but configured verification tiers end at {tiers[-1]}."
+    )
+
+
+def _round_level(entry: dict[str, Any], *, default_level: str = "L3") -> str:
     # Reviews recorded before the tier ladder use the manual-review baseline.
-    return escalate_level(latest.get("implement_level") or latest.get("level") or "L3")
+    return normalize_level(entry.get("level") or entry.get("implement_level") or default_level)
+
+
+def _convergence_cap_status(
+    rounds: Sequence[dict[str, Any]],
+    *,
+    max_review_rounds: int = 2,
+    levels: Sequence[str] | None = None,
+    verify_min_level: str | None = None,
+) -> dict[str, Any]:
+    top_level, verify_tiers = _resolve_ladder(levels, verify_min_level)
+    baseline = _manual_baseline_level(verify_tiers)
+    max_top_rounds = int(max_review_rounds)
+    max_total_rounds = len(verify_tiers[:-1]) + max_top_rounds
+    rc_rounds = [r for r in rounds if r.get("outcome") == "request_changes"]
+    total_rc = len(rc_rounds)
+    top_rank = level_rank(top_level)
+    top_rc = sum(1 for r in rc_rounds if level_rank(_round_level(r, default_level=baseline)) >= top_rank)
+    return {
+        "cap_reached": top_rc >= max_top_rounds or total_rc >= max_total_rounds,
+        "top_level": top_level,
+        "top_request_changes": top_rc,
+        "max_top_rounds": max_top_rounds,
+        "total_request_changes": total_rc,
+        "max_total_rounds": max_total_rounds,
+    }
+
+
+def _convergence_cap_blocker(cap: dict[str, Any]) -> str:
+    return (
+        f"Reached convergence cap ({cap['top_request_changes']}/{cap['max_top_rounds']} rejected rounds "
+        f"at {cap['top_level']}, {cap['total_request_changes']}/{cap['max_total_rounds']} total): "
+        "stop looping and escalate unresolved blockers to the human."
+    )
+
+
+def _last_request_changes_round(rounds: Sequence[dict[str, Any]]) -> int:
+    for idx in range(len(rounds), 0, -1):
+        if rounds[idx - 1].get("outcome") == "request_changes":
+            return idx
+    return 0
+
+
+def _matches_pure_rebase(
+    project: Path | None,
+    candidate_sha: str | None,
+    current_merge_base: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    if (
+        project is None
+        or not candidate_sha
+        or not current_merge_base
+        or not current_head_sha
+    ):
+        return False
+    cand = candidate_sha.strip().lower()
+    mb = current_merge_base.strip().lower()
+    head = current_head_sha.strip().lower()
+    if not cand or not mb or not head or cand == head:
+        return False
+    old_base_proc = run_cmd(
+        ["git", "merge-base", mb, cand],
+        cwd=project,
+        check=False,
+    )
+    if old_base_proc.returncode != 0 or not old_base_proc.stdout.strip():
+        return False
+    old_base = old_base_proc.stdout.strip().lower()
+    if old_base == mb:
+        return False
+    try:
+        compare_rebase(project, old_base, cand, mb, head)
+    except KeelError:
+        return False
+    return True
+
+
+def _pending_trees_match_pure_rebase(
+    project: Path | None,
+    base_commit_sha: str | None,
+    pending_trees: Sequence[str],
+    current_merge_base: str | None,
+    current_head_sha: str | None,
+) -> bool:
+    if (
+        project is None
+        or not base_commit_sha
+        or not pending_trees
+        or not current_merge_base
+        or not current_head_sha
+    ):
+        return False
+    base_commit = base_commit_sha.strip().lower()
+    mb = current_merge_base.strip().lower()
+    head = current_head_sha.strip().lower()
+    for sha in (base_commit, mb, head):
+        if not _HEX_SHA_RE.fullmatch(sha):
+            return False
+        if run_cmd(["git", "cat-file", "-e", f"{sha}^{{commit}}"], cwd=project, check=False).returncode != 0:
+            return False
+    old_base_proc = run_cmd(
+        ["git", "merge-base", mb, base_commit],
+        cwd=project,
+        check=False,
+    )
+    if old_base_proc.returncode != 0 or not old_base_proc.stdout.strip():
+        return False
+    old_base = old_base_proc.stdout.strip().lower()
+    if old_base == mb:
+        return False
+
+    valid_trees = [
+        t.strip().lower()
+        for t in pending_trees
+        if isinstance(t, str)
+        and _HEX_SHA_RE.fullmatch(t.strip())
+        and run_cmd(["git", "cat-file", "-e", f"{t.strip().lower()}^{{tree}}"], cwd=project, check=False).returncode == 0
+    ]
+    if not valid_trees:
+        return False
+
+    common_dir, _ = git_dirs(project)
+    objects_dir = common_dir / "objects"
+    with tempfile.TemporaryDirectory(prefix="keel-rebase-proof-") as tmp:
+        for idx, ptree in enumerate(valid_trees):
+            clean_repo = Path(tmp) / f"clean-{idx}"
+            clean_repo.mkdir()
+            run_cmd(["git", "init", "--quiet", "-b", "main", str(clean_repo)], env=_sanitized_git_env())
+            alt_file = clean_repo / ".git" / "objects" / "info" / "alternates"
+            alt_file.parent.mkdir(parents=True, exist_ok=True)
+            alt_file.write_text(f"{objects_dir}\n", encoding="utf-8")
+            ct_proc = run_cmd(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Keel Rebase Proof",
+                    "-c",
+                    "user.email=keel@localhost",
+                    "commit-tree",
+                    ptree,
+                    "-p",
+                    base_commit,
+                    "-m",
+                    "keel-pending",
+                ],
+                cwd=clean_repo,
+                env=_sanitized_git_env(),
+                check=False,
+            )
+            if ct_proc.returncode != 0 or not ct_proc.stdout.strip():
+                continue
+            cand_sha = ct_proc.stdout.strip().lower()
+            try:
+                _prove_rebase_in_clean_repo(clean_repo, old_base, cand_sha, mb, head)
+                return True
+            except KeelError:
+                continue
+    return False
+
+
+def _last_write_is_fresh(
+    last_write: dict[str, Any] | None,
+    rounds: Sequence[dict[str, Any]],
+    *,
+    current_head_sha: str | None = None,
+    current_tree_sha: str | None = None,
+    common_dir: Path | None = None,
+    project: Path | None = None,
+    current_merge_base: str | None = None,
+) -> bool:
+    if not last_write or not last_write.get("level"):
+        return False
+    write_sha = last_write.get("head_sha")
+    head_tree_sha = last_write.get("head_tree_sha")
+    raw_pending = last_write.get("pending_tree_shas")
+    pending_trees = raw_pending if isinstance(raw_pending, list) else []
+    has_recorded_target = bool(write_sha or head_tree_sha or pending_trees)
+    sha_matches = bool(write_sha and current_head_sha and write_sha == current_head_sha)
+    tree_matches = bool(current_tree_sha and current_tree_sha in pending_trees)
+    head_tree_matches = bool(
+        head_tree_sha and current_tree_sha and current_tree_sha == head_tree_sha
+    )
+    direct_matches = sha_matches or tree_matches or head_tree_matches
+    rebase_matches = (
+        False
+        if direct_matches
+        else (
+            _matches_pure_rebase(project, write_sha, current_merge_base, current_head_sha)
+            or _pending_trees_match_pure_rebase(
+                project, write_sha, pending_trees, current_merge_base, current_head_sha
+            )
+        )
+    )
+    target_matches = direct_matches or rebase_matches
+    if has_recorded_target and current_head_sha and not target_matches:
+        return False
+    if not rounds:
+        return True
+
+    if "after_round" in last_write:
+        after_round = last_write.get("after_round")
+        written_after_latest = isinstance(after_round, int) and after_round >= len(rounds)
+    else:
+        reworked_round = last_write.get("reworked_round")
+        write_ts = last_write.get("recorded_at")
+        latest_ts = rounds[-1].get("recorded_at")
+        written_after_latest = (
+            (isinstance(reworked_round, int) and reworked_round >= len(rounds))
+            or (isinstance(write_ts, str) and isinstance(latest_ts, str) and write_ts > latest_ts)
+        )
+
+    if rounds[-1].get("outcome") == "request_changes":
+        return written_after_latest
+
+    if written_after_latest:
+        return True
+
+    if has_recorded_target:
+        return target_matches
+
+    reworked_round = last_write.get("reworked_round")
+    write_ts = last_write.get("recorded_at")
+    if isinstance(reworked_round, int) and 0 <= reworked_round < len(rounds):
+        anchor = rounds[reworked_round]
+    elif isinstance(write_ts, str):
+        anchor = next(
+            (
+                entry
+                for entry in rounds
+                if isinstance(entry.get("recorded_at"), str) and entry["recorded_at"] >= write_ts
+            ),
+            rounds[0],
+        )
+    else:
+        anchor = rounds[0]
+
+    anchor_impl = anchor.get("implement_level")
+    if anchor_impl:
+        if normalize_level(anchor_impl) != normalize_level(last_write["level"]):
+            return False
+    elif "implement_level" in anchor or _last_request_changes_round(rounds) != 0:
+        return False
+
+    anchor_sha = anchor.get("head_sha")
+    if not (current_head_sha and isinstance(anchor_sha, str) and anchor_sha):
+        return False
+    if current_head_sha == anchor_sha:
+        return True
+    if common_dir is not None and current_tree_sha:
+        at_proc = run_cmd(
+            ["git", "--git-dir", str(common_dir), "rev-parse", f"{anchor_sha}^{{tree}}"],
+            check=False,
+        )
+        if (
+            at_proc.returncode == 0
+            and at_proc.stdout.strip()
+            and at_proc.stdout.strip().lower() == current_tree_sha
+        ):
+            return True
+    return _matches_pure_rebase(project, anchor_sha, current_merge_base, current_head_sha)
+
+
+def _rework_floor(
+    rounds: Sequence[dict[str, Any]],
+    *,
+    levels: Sequence[str] | None = None,
+    verify_min_level: str | None = None,
+) -> str | None:
+    if not rounds or rounds[-1].get("outcome") != "request_changes":
+        return None
+    start_idx = 0
+    for idx in range(len(rounds) - 1, -1, -1):
+        if rounds[idx].get("outcome") == "approve":
+            start_idx = idx + 1
+            break
+    _, verify_tiers = _resolve_ladder(levels, verify_min_level)
+    min_verify = verify_tiers[0]
+    baseline = _manual_baseline_level(verify_tiers)
+    active_floor: str | None = None
+    for entry in rounds[start_idx:]:
+        if entry.get("outcome") != "request_changes":
+            continue
+        raw_impl = entry.get("implement_level")
+        impl = normalize_level(raw_impl) if raw_impl else None
+        if impl and (active_floor is None or level_rank(impl) >= level_rank(active_floor)):
+            base_level = max_level(impl, min_verify)
+        else:
+            # Missing `implement_level` (direct edit / legacy manual review) or stale legacy
+            # `implement_level` below the already-active floor uses the review tier / active floor.
+            review_lvl = normalize_level(entry.get("level") or baseline)
+            base_level = max_level(review_lvl, active_floor) if active_floor else review_lvl
+        active_floor = _escalate_in_ladder(base_level, levels)
+    return active_floor
+
+
+def _verify_floor(
+    rounds: Sequence[dict[str, Any]],
+    *,
+    fresh_write: bool,
+    levels: Sequence[str] | None = None,
+    verify_min_level: str | None = None,
+) -> str | None:
+    floor = _rework_floor(rounds, levels=levels, verify_min_level=verify_min_level)
+    if floor is None or fresh_write:
+        return floor
+    latest_level = rounds[-1].get("level")
+    if latest_level:
+        return max_level(floor, _escalate_in_ladder(latest_level, levels))
+    return floor
 
 
 def prepare_branch_write(
@@ -509,26 +882,182 @@ def prepare_branch_write(
         raise KeelConfigError(f"Resume with --level to record the implementation tier on '{branch}'.")
     common_dir, _ = git_dirs(workdir)
     state = load_branch_state(common_dir, branch)
-    rounds = state.get("rounds", [])
-    floor = _rework_floor(rounds)
-    last_write = state.get("last_write") or {}
-    if floor and last_write.get("reworked_round") != len(rounds) and level_rank(level) < level_rank(floor):
+    rounds = _review_rounds(state)
+    floor = _rework_floor(
+        rounds,
+        levels=defaults.get("levels"),
+        verify_min_level=defaults.get("verify_min_level"),
+    )
+    if floor and level_rank(level) < level_rank(floor):
         raise KeelConfigError(f"Rework on '{branch}' requires --level {floor} or higher.")
     return common_dir, branch
 
 
-def record_branch_write(target: tuple[Path, str] | None, executor: str, result: dict[str, Any]) -> None:
+def _resolve_write_worktree(common_dir: Path, branch: str, result: dict[str, Any]) -> Path | None:
+    raw_workdir = result.get("workdir")
+    if isinstance(raw_workdir, str) and raw_workdir.strip():
+        candidate = Path(raw_workdir)
+        if candidate.is_dir():
+            cur = run_cmd(["git", "branch", "--show-current"], cwd=candidate, check=False).stdout.strip()
+            top = run_cmd(
+                ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"],
+                cwd=candidate,
+                check=False,
+            )
+            if cur == branch and top.returncode == 0 and top.stdout.strip():
+                return safe_resolve(top.stdout.strip())
+    target_ref = f"refs/heads/{branch}"
+    wt_proc = run_cmd(
+        ["git", "--git-dir", str(common_dir), "worktree", "list", "--porcelain"],
+        check=False,
+    )
+    if wt_proc.returncode == 0:
+        cur_wt: Path | None = None
+        for line in wt_proc.stdout.splitlines():
+            if line.startswith("worktree "):
+                cur_wt = Path(line[len("worktree ") :].strip())
+            elif line.startswith("branch ") and line[len("branch ") :].strip() == target_ref and cur_wt and cur_wt.is_dir():
+                return safe_resolve(cur_wt)
+            elif not line.strip():
+                cur_wt = None
+    return None
+
+
+def _snapshot_pending_tree_shas(
+    common_dir: Path,
+    wt_path: Path,
+    head_sha: str | None,
+    *,
+    head_tree_sha: str | None = None,
+) -> list[str]:
+    porcelain = run_cmd(["git", "status", "--porcelain", "-uall"], cwd=wt_path, check=False)
+    if porcelain.returncode != 0 or not porcelain.stdout.strip():
+        return []
+    if head_tree_sha is None and head_sha:
+        ht = run_cmd(["git", "--git-dir", str(common_dir), "rev-parse", f"{head_sha}^{{tree}}"], check=False)
+        if ht.returncode == 0 and ht.stdout.strip():
+            head_tree_sha = ht.stdout.strip().lower()
+
+    idx_proc = run_cmd(
+        ["git", "rev-parse", "--path-format=absolute", "--git-path", "index"],
+        cwd=wt_path,
+        check=False,
+    )
+    real_index = Path(idx_proc.stdout.strip()) if idx_proc.returncode == 0 and idx_proc.stdout.strip() else None
+
+    with tempfile.TemporaryDirectory(prefix="keel-write-tree-") as tmp:
+        tmp_dir = Path(tmp)
+        tmp_objects = tmp_dir / "objects"
+        (tmp_objects / "info").mkdir(parents=True, exist_ok=True)
+        (tmp_objects / "pack").mkdir(parents=True, exist_ok=True)
+        base_env = {
+            k: v
+            for k, v in tool_env().items()
+            if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+        }
+        base_env["GIT_TERMINAL_PROMPT"] = "0"
+        base_env["GIT_OBJECT_DIRECTORY"] = str(tmp_objects)
+        real_objects = str(common_dir / "objects")
+        existing_alts = base_env.get("GIT_ALTERNATE_OBJECT_DIRECTORIES", "")
+        base_env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = (
+            f"{real_objects}{os.pathsep}{existing_alts}" if existing_alts else real_objects
+        )
+        git_base = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.quotePath=false"]
+
+        staged_tree_sha: str | None = None
+        if real_index and real_index.is_file():
+            idx_staged = tmp_dir / "index_staged"
+            shutil.copy2(real_index, idx_staged)
+            st_proc = run_cmd(
+                [*git_base, "write-tree"],
+                cwd=wt_path,
+                env={**base_env, "GIT_INDEX_FILE": str(idx_staged)},
+                check=False,
+            )
+            if st_proc.returncode == 0 and st_proc.stdout.strip():
+                staged_tree_sha = st_proc.stdout.strip().lower()
+
+        tracked_tree_sha: str | None = None
+        if (real_index and real_index.is_file()) or head_sha:
+            idx_tracked = tmp_dir / "index_tracked"
+            tr_env = {**base_env, "GIT_INDEX_FILE": str(idx_tracked)}
+            if real_index and real_index.is_file():
+                shutil.copy2(real_index, idx_tracked)
+            elif head_sha:
+                run_cmd([*git_base, "read-tree", head_sha], cwd=wt_path, env=tr_env, check=False)
+            upd_proc = run_cmd([*git_base, "add", "-u"], cwd=wt_path, env=tr_env, check=False)
+            if upd_proc.returncode == 0:
+                tr_proc = run_cmd([*git_base, "write-tree"], cwd=wt_path, env=tr_env, check=False)
+                if tr_proc.returncode == 0 and tr_proc.stdout.strip():
+                    tracked_tree_sha = tr_proc.stdout.strip().lower()
+
+        worktree_tree_sha: str | None = None
+        idx_wt = tmp_dir / "index_wt"
+        wt_env = {**base_env, "GIT_INDEX_FILE": str(idx_wt)}
+        if real_index and real_index.is_file():
+            shutil.copy2(real_index, idx_wt)
+        elif head_sha:
+            run_cmd([*git_base, "read-tree", head_sha], cwd=wt_path, env=wt_env, check=False)
+        add_proc = run_cmd([*git_base, "add", "-A"], cwd=wt_path, env=wt_env, check=False)
+        if add_proc.returncode == 0:
+            wt_proc = run_cmd([*git_base, "write-tree"], cwd=wt_path, env=wt_env, check=False)
+            if wt_proc.returncode == 0 and wt_proc.stdout.strip():
+                worktree_tree_sha = wt_proc.stdout.strip().lower()
+
+    return sorted(
+        {t for t in (staged_tree_sha, tracked_tree_sha, worktree_tree_sha) if t and t != head_tree_sha}
+    )
+
+
+def record_branch_write(
+    target: tuple[Path, str] | None,
+    executor: str,
+    result: dict[str, Any],
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> None:
     if target is None or result.get("status") != "completed":
         return
+    common_dir, branch = target
+    head_proc = run_cmd(
+        ["git", "--git-dir", str(common_dir), "rev-parse", f"refs/heads/{branch}"],
+        check=False,
+    )
+    head_sha = head_proc.stdout.strip().lower() if head_proc.returncode == 0 and head_proc.stdout.strip() else None
+    head_tree_sha: str | None = None
+    if head_sha:
+        ht_proc = run_cmd(
+            ["git", "--git-dir", str(common_dir), "rev-parse", f"{head_sha}^{{tree}}"],
+            check=False,
+        )
+        if ht_proc.returncode == 0 and ht_proc.stdout.strip():
+            head_tree_sha = ht_proc.stdout.strip().lower()
+    wt_path = _resolve_write_worktree(common_dir, branch, result)
+    pending_tree_shas = (
+        _snapshot_pending_tree_shas(common_dir, wt_path, head_sha, head_tree_sha=head_tree_sha)
+        if wt_path
+        else []
+    )
     level = result["level"]
-    with edit_gate_state(*target) as state:
-        write = {"executor": executor, "level": level, "recorded_at": _now_iso()}
+    levels = defaults.get("levels") if defaults else None
+    verify_min_level = defaults.get("verify_min_level") if defaults else None
+    with edit_gate_state(common_dir, branch) as state:
         rounds = state["rounds"]
-        floor = _rework_floor(rounds)
-        if floor:
-            previous = state.get("last_write") or {}
-            if level_rank(level) >= level_rank(floor) or previous.get("reworked_round") == len(rounds):
-                write["reworked_round"] = len(rounds)
+        write: dict[str, Any] = {
+            "executor": executor,
+            "level": level,
+            "after_round": len(rounds),
+            "recorded_at": _now_iso(),
+        }
+        if head_sha:
+            write["head_sha"] = head_sha
+        if head_tree_sha:
+            write["head_tree_sha"] = head_tree_sha
+        if pending_tree_shas:
+            write["pending_tree_shas"] = pending_tree_shas
+        floor = _rework_floor(rounds, levels=levels, verify_min_level=verify_min_level)
+        if floor and level_rank(level) >= level_rank(floor):
+            write["reworked_round"] = len(rounds)
         state["last_write"] = write
 
 
@@ -622,6 +1151,7 @@ def verify_branch(
     base_ref = resolve_base_ref(project, base, default_branches=default_branches)
 
     head_sha = run_cmd(["git", "rev-parse", f"refs/heads/{branch}"], cwd=project).stdout.strip().lower()
+    head_tree_sha = run_cmd(["git", "rev-parse", f"{head_sha}^{{tree}}"], cwd=project).stdout.strip().lower()
     base_tip_sha = run_cmd(["git", "rev-parse", f"{base_ref}^{{commit}}"], cwd=project).stdout.strip().lower()
     merge_base_sha = run_cmd(["git", "merge-base", base_tip_sha, head_sha], cwd=project).stdout.strip().lower()
 
@@ -638,24 +1168,60 @@ def verify_branch(
 
     initial_state = load_branch_state(common_dir, branch)
     max_rounds = int(defaults.get("max_review_rounds", 2))
+    raw_cfg_levels = defaults.get("levels")
+    if raw_cfg_levels is not None:
+        if not isinstance(raw_cfg_levels, (list, tuple)) or not raw_cfg_levels:
+            raise KeelConfigError("Expected a non-empty levels list in defaults.json.")
+        configured_levels = [normalize_level(lvl) for lvl in raw_cfg_levels]
+    else:
+        configured_levels = list(VALID_LEVELS)
+    verify_min_level = normalize_level(defaults.get("verify_min_level") or "L2")
 
     def check_round_limit(state: dict[str, Any]) -> None:
-        rejected = _request_changes_count(state.get("rounds", []))
-        if rejected >= max_rounds and not force_round:
+        cap = _convergence_cap_status(
+            state.get("rounds", []),
+            max_review_rounds=max_rounds,
+            levels=configured_levels,
+            verify_min_level=verify_min_level,
+        )
+        if cap["cap_reached"] and not force_round:
             raise KeelError(
-                f"Branch '{branch}' reached its {max_rounds}-round convergence cap. "
+                f"Branch '{branch}' reached its convergence cap "
+                f"({cap['top_request_changes']}/{cap['max_top_rounds']} rejected rounds at {cap['top_level']}, "
+                f"{cap['total_request_changes']}/{cap['max_total_rounds']} total). "
                 "Stop looping and escalate unresolved blockers to the human."
             )
 
     check_round_limit(initial_state)
+    _, verify_tiers = _resolve_ladder(configured_levels, verify_min_level)
+    default_manual_level = _manual_baseline_level(verify_tiers)
+    initial_rounds = _review_rounds(initial_state)
     last_write = initial_state.get("last_write") or {}
-    implement_level = last_write.get("level")
-    minimum = normalize_level(defaults["verify_min_level"])
+    fresh_write = _last_write_is_fresh(
+        last_write,
+        initial_rounds,
+        current_head_sha=head_sha,
+        current_tree_sha=head_tree_sha,
+        common_dir=common_dir,
+        project=project,
+        current_merge_base=merge_base_sha,
+    )
+    implement_level = normalize_level(last_write["level"]) if fresh_write else None
+    floor = _verify_floor(
+        initial_rounds,
+        fresh_write=fresh_write,
+        levels=configured_levels,
+        verify_min_level=verify_min_level,
+    )
+    minimum = verify_min_level
     if implement_level:
         minimum = max_level(minimum, implement_level)
+    if floor:
+        minimum = max_level(minimum, floor)
+    minimum = _ceil_in_tiers(minimum, verify_tiers)
     if level is None:
-        level = minimum if implement_level else "L3"
-    level = normalize_level(level)
+        level = minimum if implement_level else max_level(minimum, default_manual_level)
+    level = normalize_level(level, defaults={"levels": configured_levels})
     if level_rank(level) < level_rank(minimum):
         raise KeelConfigError(f"Verification requires --level {minimum} or higher, got {level}.")
 
@@ -792,6 +1358,8 @@ def evaluate_branch_gate(
     human_override: str | None = None,
     task_file_arg: str | None = None,
     max_review_rounds: int = 2,
+    levels: Sequence[str] = VALID_LEVELS,
+    verify_min_level: str = "L2",
     default_branches: Sequence[str] = ("main", "master"),
     require_clean_checkouts: bool = False,
     pinned_head_sha: str | None = None,
@@ -839,7 +1407,13 @@ def evaluate_branch_gate(
         return next((entry for entry in reversed(rounds) if entry["head_sha"] == sha), {})
 
     current = latest_for(head_sha)
-    rc_rounds = _request_changes_count(rounds)
+    cap = _convergence_cap_status(
+        rounds,
+        max_review_rounds=max_review_rounds,
+        levels=levels,
+        verify_min_level=verify_min_level,
+    )
+    rc_rounds = cap["total_request_changes"]
 
     approval_source: str | None = None
     rebase_proof: dict[str, Any] | None = None
@@ -904,11 +1478,15 @@ def evaluate_branch_gate(
                 f"Latest approval on commit {head_sha[:12]} does not match target merge-base "
                 f"({merge_base_sha[:12] or 'none'}) and locked task criteria ({task_file!r}); run fresh verification."
             )
+            if cap["cap_reached"]:
+                blockers.append(_convergence_cap_blocker(cap))
     elif current:
         if human_override and human_override.strip():
             approval_source = f"human-override:{human_override.strip()}"
         else:
             blockers.append(f"Commit {head_sha[:12]} carries an active '{current['outcome']}' verdict.")
+            if cap["cap_reached"]:
+                blockers.append(_convergence_cap_blocker(cap))
     elif old_base and old_head:
         old_base_lc = old_base.strip().lower()
         old_head_lc = old_head.strip().lower()
@@ -925,16 +1503,15 @@ def evaluate_branch_gate(
                 f"Approval on {old_head_lc[:12]} does not match target base ({old_base_lc[:12]}) or "
                 f"revised task criteria ({task_file!r}); run fresh verification."
             )
+            if cap["cap_reached"]:
+                blockers.append(_convergence_cap_blocker(cap))
         elif not missing_rebase_checks:
             approval_source = f"pure-rebase-from:{old_head_lc[:12]}"
     elif human_override and human_override.strip():
         approval_source = f"human-override:{human_override.strip()}"
     else:
-        if rc_rounds >= max_review_rounds:
-            blockers.append(
-                f"Reached {rc_rounds} 'request_changes' rounds (>= {max_review_rounds}-round cap): "
-                "stop looping and escalate to the human."
-            )
+        if cap["cap_reached"]:
+            blockers.append(_convergence_cap_blocker(cap))
         else:
             blockers.append(f"No independent 'approve' verdict recorded for commit {head_sha[:12]}.")
 
@@ -977,6 +1554,8 @@ def branch_repo_overview(
     *,
     base: str | None = None,
     max_review_rounds: int = 2,
+    levels: Sequence[str] = VALID_LEVELS,
+    verify_min_level: str = "L2",
     default_branches: Sequence[str] = ("main", "master"),
 ) -> dict[str, Any]:
     project = primary_checkout_root(project)
@@ -1002,6 +1581,8 @@ def branch_repo_overview(
                 bname,
                 base=base_ref,
                 max_review_rounds=max_review_rounds,
+                levels=levels,
+                verify_min_level=verify_min_level,
                 default_branches=default_branches,
             )
             active_task = gate["task_file"]
@@ -1271,6 +1852,8 @@ def land_branch(
         _record_skipped_checks(common_dir, branch, pinned_head_sha, skip_checks)
 
     max_review_rounds = int(defaults.get("max_review_rounds", 2))
+    configured_levels = tuple(defaults.get("levels", VALID_LEVELS))
+    verify_min_level = str(defaults.get("verify_min_level", "L2"))
     gate = evaluate_branch_gate(
         project,
         branch,
@@ -1280,6 +1863,8 @@ def land_branch(
         human_override=human_override,
         task_file_arg=task_file_arg,
         max_review_rounds=max_review_rounds,
+        levels=configured_levels,
+        verify_min_level=verify_min_level,
         default_branches=default_branches,
         require_clean_checkouts=True,
         pinned_head_sha=pinned_head_sha,
@@ -1316,6 +1901,8 @@ def land_branch(
                 human_override=human_override,
                 task_file_arg=task_file_arg,
                 max_review_rounds=max_review_rounds,
+                levels=configured_levels,
+                verify_min_level=verify_min_level,
                 default_branches=default_branches,
                 require_clean_checkouts=True,
                 pinned_head_sha=pinned_head_sha,

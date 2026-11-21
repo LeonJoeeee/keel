@@ -29,7 +29,7 @@ keel agent run --level L2 --executor agy --mode write --preset implement \
 
 ## Verify and land
 
-Verify the clean, committed branch with its deterministic checks. With a recorded write, Keel selects the other vendor at the write level or L2, whichever is higher. Use `--dual` to run both vendors concurrently. Each verifier gets a separate clone and exercises a realistic workflow, including a one-line Canary mutation to check that the tests detect a break. The gate records the verdict on return.
+Verify the clean, committed branch with its deterministic checks. With a recorded write, Keel selects the other vendor at the write level or L2, whichever is higher. Use `--dual` to run both vendors concurrently. Each verifier gets a separate clone and exercises a realistic workflow, including a one-line Canary mutation to check that the tests detect a break. The gate records the verdict on return, steps up rework and verification tiers after a rejection, and enforces a tier-aware convergence cap (`L2(1) -> L3(1) -> L4(2)`—at most 4 rounds from L2, 3 from L3, or 2 from L4).
 
 ```sh
 keel branch verify parser-fix --check "python3 -m unittest discover -s tests"

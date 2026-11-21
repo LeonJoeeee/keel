@@ -374,11 +374,15 @@ class BranchGateTests(unittest.TestCase):
             with mock.patch.object(CodexExecutor, "execute", fake_rc):
                 r1 = _run_cli(["branch", "verify", "sub", "--project", str(repo)])
                 r2 = _run_cli(["branch", "verify", "sub", "--project", str(repo)])
+                r3 = _run_cli(["branch", "verify", "sub", "--project", str(repo)])
+                self.assertEqual([r1["level"], r2["level"], r3["level"]], ["L3", "L4", "L4"])
                 self.assertIs(r1["forced_round"], False)
                 self.assertIs(r2["forced_round"], False)
+                self.assertIs(r3["forced_round"], False)
                 saved_rounds = load_branch_state(repo / ".git", "task/sub")["rounds"]
-                self.assertEqual([entry["forced_round"] for entry in saved_rounds], [False, False])
-                # 3rd round blocked by 2-round circuit breaker and must NOT suggest `--force-round`!
+                self.assertEqual([entry["forced_round"] for entry in saved_rounds], [False, False, False])
+                self.assertEqual([entry["level"] for entry in saved_rounds], ["L3", "L4", "L4"])
+                # 4th round (after L3 -> L4 -> L4) blocked by tier-aware circuit breaker and must NOT suggest `--force-round`!
                 with self.assertRaises(KeelError) as cap_ctx:
                     _run_cli(["branch", "verify", "sub", "--project", str(repo)])
                 cap_msg = str(cap_ctx.exception)
@@ -795,7 +799,9 @@ class BranchGateTests(unittest.TestCase):
                   mock.patch.object(bg, "run_deterministic_checks", checks)):
                 with self.assertRaisesRegex(KeelError, "request_changes"):
                     _run_cli([*land, "--check", "true"])
-                _run_cli(verify)
+                r2 = _run_cli(verify)
+                r3 = _run_cli(verify)
+                self.assertEqual((r2["level"], r3["level"]), ("L4", "L4"))
                 with self.assertRaisesRegex(KeelError, "convergence cap"):
                     _run_cli(verify)
             with mock.patch.object(CodexExecutor, "execute", verifier()):
@@ -1803,6 +1809,1298 @@ class BranchGateTests(unittest.TestCase):
             land_t2 = _run_cli(["branch", "land", "todo-child", "--ff-only", "--project", str(repo), "--execute"])
             self.assertTrue(land_t2["landed"])
             self.assertTrue(land_t2["approval_source"].startswith("direct-approve:"))
+
+    def test_tier_aware_convergence_cap_l2_l3_l4_and_status_consistency(self) -> None:
+        from keel_lib.branch_gate import evaluate_branch_gate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init_repo_with_task(repo, slug="ladder")
+            project = ["--project", str(repo)]
+
+            def write_exec(adapter: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("request_changes")(adapter, req, defaults)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            # 1) L2 start full ladder: L2 -> L3 -> L4 -> L4 (4 rounds), 5th blocked, --force-round recovers
+            wt_l2 = Path(_run_cli(["worktree", "create", "l2-start", *project])["path"])
+            (wt_l2 / "calc.py").write_text("V = 1\n", encoding="utf-8")
+            _git(wt_l2, "commit", "-am", "feat: l2 start")
+            run_l2 = ["agent", "run", *project, "--cwd", str(wt_l2), "--why", "Ladder", "--task", "Fix", "--mode", "write"]
+            verify_l2 = ["branch", "verify", "l2-start", *project]
+
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([*run_l2, "--executor", "agy", "--level", "L2"])
+                r1 = _run_cli(verify_l2)
+                self.assertEqual(r1["level"], "L2")
+                _run_cli([*run_l2, "--executor", "agy", "--level", "L3"])
+                r2 = _run_cli(verify_l2)
+                self.assertEqual(r2["level"], "L3")
+
+                # After 2 lower-tier rejections (L2, L3), status on a fresh commit must NOT report convergence cap!
+                (wt_l2 / "calc.py").write_text("V = 2\n", encoding="utf-8")
+                _git(wt_l2, "commit", "-am", "fix: prep for L4")
+                mid_status = _run_cli(["branch", "status", "l2-start", *project])
+                self.assertFalse(mid_status["ready_to_land"])
+                self.assertFalse(any("convergence cap" in b.lower() for b in mid_status["blockers"]))
+                self.assertTrue(any("No independent 'approve' verdict" in b for b in mid_status["blockers"]))
+
+                _run_cli([*run_l2, "--executor", "agy", "--level", "L4"])
+                r3 = _run_cli(verify_l2)
+                self.assertEqual(r3["level"], "L4")
+                _run_cli([*run_l2, "--executor", "agy", "--level", "L4"])
+                r4 = _run_cli(verify_l2)
+                self.assertEqual(r4["level"], "L4")
+
+                with self.assertRaises(KeelError) as cap_l2:
+                    _run_cli(verify_l2)
+                self.assertIn("convergence cap", str(cap_l2.exception))
+                self.assertNotIn("force-round", str(cap_l2.exception).lower())
+
+                # `branch status` reports convergence cap consistently both on rejected commit and new commit
+                st_same = _run_cli(["branch", "status", "l2-start", *project])
+                self.assertTrue(any("convergence cap" in b.lower() for b in st_same["blockers"]))
+                self.assertFalse(any("force-round" in b.lower() for b in st_same["blockers"]))
+
+                (wt_l2 / "calc.py").write_text("V = 3\n", encoding="utf-8")
+                _git(wt_l2, "commit", "-am", "fix: post-cap commit")
+                st_new = _run_cli(["branch", "status", "l2-start", *project])
+                self.assertTrue(any("convergence cap" in b.lower() for b in st_new["blockers"]))
+                self.assertFalse(any("force-round" in b.lower() for b in st_new["blockers"]))
+
+                # Direct `evaluate_branch_gate` with only `max_review_rounds=2` matches CLI behavior
+                direct_gate = evaluate_branch_gate(repo, "l2-start", max_review_rounds=2)
+                self.assertTrue(any("convergence cap" in b.lower() for b in direct_gate["blockers"]))
+                # Custom 3-tier ladder (`L1..L3`, `verify_min_level="L2"`) derives top_level=L3 and max_total=3
+                custom_gate = evaluate_branch_gate(
+                    repo, "l2-start", max_review_rounds=2, levels=("L1", "L2", "L3"), verify_min_level="L2",
+                )
+                self.assertTrue(any("at L3" in b and "4/3 total" in b for b in custom_gate["blockers"]))
+
+            with mock.patch.object(CodexExecutor, "execute", verifier("approve")):
+                recovered = _run_cli([*verify_l2, "--force-round"])
+            self.assertEqual(recovered["outcome"], "approve")
+            self.assertIs(recovered["forced_round"], True)
+            self.assertIs(load_branch_state(repo / ".git", "task/l2-start")["rounds"][-1]["forced_round"], True)
+            self.assertTrue(_run_cli(["branch", "status", "l2-start", *project])["ready_to_land"])
+
+            # 2) L3 start: L3 -> L4 -> L4 (3 rounds), 4th blocked
+            wt_l3 = Path(_run_cli(["worktree", "create", "l3-start", *project])["path"])
+            (wt_l3 / "calc.py").write_text("V = 30\n", encoding="utf-8")
+            _git(wt_l3, "commit", "-am", "feat: l3 start")
+            verify_l3 = ["branch", "verify", "l3-start", *project]
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                levels_l3 = [_run_cli(verify_l3)["level"] for _ in range(3)]
+                self.assertEqual(levels_l3, ["L3", "L4", "L4"])
+                with self.assertRaises(KeelError) as cap_l3:
+                    _run_cli(verify_l3)
+                self.assertIn("convergence cap", str(cap_l3.exception))
+                self.assertNotIn("force-round", str(cap_l3.exception).lower())
+            st_l3 = _run_cli(["branch", "status", "l3-start", *project])
+            self.assertTrue(any("convergence cap" in b.lower() for b in st_l3["blockers"]))
+
+            # 3) L4 start: L4 -> L4 (2 rounds), 3rd blocked
+            wt_l4 = Path(_run_cli(["worktree", "create", "l4-start", *project])["path"])
+            (wt_l4 / "calc.py").write_text("V = 40\n", encoding="utf-8")
+            _git(wt_l4, "commit", "-am", "feat: l4 start")
+            verify_l4 = ["branch", "verify", "l4-start", *project]
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                r4_1 = _run_cli([*verify_l4, "--level", "L4"])
+                r4_2 = _run_cli(verify_l4)
+                self.assertEqual((r4_1["level"], r4_2["level"]), ("L4", "L4"))
+                with self.assertRaises(KeelError) as cap_l4:
+                    _run_cli(verify_l4)
+                self.assertIn("convergence cap", str(cap_l4.exception))
+                self.assertNotIn("force-round", str(cap_l4.exception).lower())
+            st_l4 = _run_cli(["branch", "status", "l4-start", *project])
+            self.assertTrue(any("convergence cap" in b.lower() for b in st_l4["blockers"]))
+
+    def test_dual_side_step_up_direct_edits_stale_write_and_explicit_l4_verify(self) -> None:
+        import keel_lib.branch_gate as bg
+        from keel_lib.worktree import save_branch_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init_repo_with_task(repo, slug="stepup")
+            project = ["--project", str(repo)]
+            defaults = KEEL_CLI.load_defaults()
+
+            # A) Direct-edit (no `keel agent run`): verify --level L2 rejection -> L2 refused (KeelConfigError),
+            #    omitted --level auto-escalates to L3 -> after L3 rejection, L3 refused and auto-escalates to L4.
+            wt_direct = Path(_run_cli(["worktree", "create", "direct-edit", *project])["path"])
+            (wt_direct / "calc.py").write_text("D = 1\n", encoding="utf-8")
+            _git(wt_direct, "commit", "-am", "feat: direct edit")
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                d1 = bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults, level="L2")
+                self.assertEqual(d1["level"], "L2")
+                with self.assertRaisesRegex(KeelConfigError, "L3"):
+                    bg.prepare_branch_write(wt_direct, "write", "L2", defaults)
+                with self.assertRaisesRegex(KeelConfigError, "L3"):
+                    bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults, level="L2")
+                d2 = bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults)
+                self.assertEqual(d2["level"], "L3")
+                with self.assertRaisesRegex(KeelConfigError, "L4"):
+                    bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults, level="L3")
+                d3 = bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults)
+                self.assertEqual(d3["level"], "L4")
+                d4 = bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults)
+                self.assertEqual(d4["level"], "L4")
+                with self.assertRaisesRegex(KeelError, "convergence cap"):
+                    bg.verify_branch(project=repo, branch_or_slug="direct-edit", defaults=defaults)
+
+            # B) Stale `last_write` (L2) followed by R1 rejection and direct edit (no fresh `keel agent run`)
+            #    still escalates R2 verify to L3 and R3 verify to L4 (cannot spin at L3).
+            wt_stale = Path(_run_cli(["worktree", "create", "stale-write", *project])["path"])
+            (wt_stale / "calc.py").write_text("S = 1\n", encoding="utf-8")
+            _git(wt_stale, "commit", "-am", "feat: stale write")
+
+            def write_exec(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("request_changes")(adapter, req, cfg)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_stale), "--executor", "agy",
+                    "--mode", "write", "--level", "L2", "--why", "Stale test", "--task", "Init",
+                ])
+                s1 = bg.verify_branch(project=repo, branch_or_slug="stale-write", defaults=defaults)
+                self.assertEqual(s1["level"], "L2")
+                # Direct edit without calling `keel agent run`
+                (wt_stale / "calc.py").write_text("S = 2\n", encoding="utf-8")
+                _git(wt_stale, "commit", "-am", "fix: direct edit after R1")
+                with self.assertRaisesRegex(KeelConfigError, "L3"):
+                    bg.verify_branch(project=repo, branch_or_slug="stale-write", defaults=defaults, level="L2")
+                s2 = bg.verify_branch(project=repo, branch_or_slug="stale-write", defaults=defaults)
+                self.assertEqual(s2["level"], "L3")
+                # Second direct edit without calling `keel agent run` MUST escalate R3 to L4 (never spin at L3!)
+                (wt_stale / "calc.py").write_text("S = 3\n", encoding="utf-8")
+                _git(wt_stale, "commit", "-am", "fix: direct edit after R2")
+                with self.assertRaisesRegex(KeelConfigError, "L4"):
+                    bg.verify_branch(project=repo, branch_or_slug="stale-write", defaults=defaults, level="L3")
+                s3 = bg.verify_branch(project=repo, branch_or_slug="stale-write", defaults=defaults)
+                self.assertEqual(s3["level"], "L4")
+
+            # B2) Legacy state lacking `after_round` on `last_write` still treats pre-rejection write as stale
+            wt_legacy = Path(_run_cli(["worktree", "create", "legacy-stale", *project])["path"])
+            (wt_legacy / "calc.py").write_text("L = 1\n", encoding="utf-8")
+            _git(wt_legacy, "commit", "-am", "feat: legacy")
+            legacy_head = _git(wt_legacy, "rev-parse", "HEAD")
+            save_branch_state(repo / ".git", "task/legacy-stale", {
+                "branch": "task/legacy-stale",
+                "last_write": {"executor": "agy", "level": "L2", "recorded_at": "2026-11-20T10:00:00.000000+00:00"},
+                "rounds": [{
+                    "head_sha": legacy_head, "outcome": "request_changes", "dual": False,
+                    "level": "L2", "implement_level": "L2",
+                    "recorded_at": "2026-11-20T10:01:00.000000+00:00",
+                    "verdicts": {"codex": {"verdict": "request_changes", "summary": "Fix",
+                                           "blocking": ["Fix"], "notes": [], "commands_run": []}},
+                }],
+                "checks_by_sha": {},
+            })
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                l2_res = bg.verify_branch(project=repo, branch_or_slug="legacy-stale", defaults=defaults)
+                self.assertEqual(l2_res["level"], "L3")
+                l3_res = bg.verify_branch(project=repo, branch_or_slug="legacy-stale", defaults=defaults)
+                self.assertEqual(l3_res["level"], "L4")
+
+            # C) Fresh L2 write verified explicitly at --level L4 (request_changes) still allows L3 rework and L3 verify
+            wt_l4v = Path(_run_cli(["worktree", "create", "l2-write-l4-verify", *project])["path"])
+            (wt_l4v / "calc.py").write_text("E = 1\n", encoding="utf-8")
+            _git(wt_l4v, "commit", "-am", "feat: l2 write")
+            run_l4v = ["agent", "run", *project, "--cwd", str(wt_l4v), "--executor", "agy",
+                       "--mode", "write", "--why", "Explicit L4 verify", "--task", "Impl"]
+            verify_l4v = ["branch", "verify", "l2-write-l4-verify", *project]
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([*run_l4v, "--level", "L2"])
+                v1 = _run_cli([*verify_l4v, "--level", "L4"])
+                self.assertEqual(v1["level"], "L4")
+                with self.assertRaisesRegex(KeelError, "L3"):
+                    _run_cli([*run_l4v, "--level", "L2"])
+                _run_cli([*run_l4v, "--level", "L3"])
+                v2 = _run_cli([*verify_l4v, "--level", "L3"])
+                self.assertEqual(v2["level"], "L3")
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/l2-write-l4-verify")["rounds"][-1]["implement_level"],
+                    "L3",
+                )
+
+            # D) Consecutive rework writes before the next verdict CANNOT downgrade below the active rework floor,
+            #    and `verify_branch` records the truthful `implement_level` of the actual writer tier.
+            wt_consec = Path(_run_cli(["worktree", "create", "consec-rework", *project])["path"])
+            (wt_consec / "calc.py").write_text("C = 1\n", encoding="utf-8")
+            _git(wt_consec, "commit", "-am", "feat: consec rework")
+            run_consec = [
+                "agent", "run", *project, "--cwd", str(wt_consec), "--executor", "agy",
+                "--mode", "write", "--why", "Consecutive rework floor", "--task", "Impl",
+                "--run-id", "consec-writer",
+            ]
+            resume_consec = ["agent", "resume", "consec-writer", *project, "--message", "Follow-up"]
+            verify_consec = ["branch", "verify", "consec-rework", *project]
+
+            def resume_exec(adapter: Any, run_dir: Any, record: Any, followup: Any, out: Any, cfg: Any, **kw: Any) -> dict[str, Any]:
+                return {"status": "completed", "level": kw.get("level") or record["level"]}
+
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(AgyExecutor, "resume", resume_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([*run_consec, "--level", "L2"])
+                c_r1 = _run_cli(verify_consec)
+                self.assertEqual(c_r1["level"], "L2")
+                # First rework write at L3 succeeds and sets `reworked_round`
+                _run_cli([*run_consec, "--level", "L3"])
+                self.assertEqual(load_branch_state(repo / ".git", "task/consec-rework")["last_write"]["reworked_round"], 1)
+                # Subsequent `agent run --level L2` and `agent resume --level L2` MUST STILL be refused with L3!
+                with self.assertRaisesRegex(KeelConfigError, "L3"):
+                    bg.prepare_branch_write(wt_consec, "write", "L2", defaults)
+                with self.assertRaisesRegex(KeelError, "L3"):
+                    _run_cli([*run_consec, "--level", "L2"])
+                with self.assertRaisesRegex(KeelError, "L3"):
+                    _run_cli([*resume_consec, "--level", "L2"])
+                self.assertEqual(load_branch_state(repo / ".git", "task/consec-rework")["last_write"]["level"], "L3")
+                c_r2 = _run_cli(verify_consec)
+                self.assertEqual(c_r2["level"], "L3")
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/consec-rework")["rounds"][-1]["implement_level"],
+                    "L3",
+                )
+                # After L3 rejection, an L4 rework followed by L3 downgrade attempt is also refused, and L4 is recorded truthfully
+                _run_cli([*resume_consec, "--level", "L4"])
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*run_consec, "--level", "L3"])
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*resume_consec, "--level", "L3"])
+                c_r3 = _run_cli(verify_consec)
+                self.assertEqual(c_r3["level"], "L4")
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/consec-rework")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+            # E) Legacy in-progress branch upgrade: old `main` copied stale `implement_level="L2"` onto a direct-edit
+            #    R2 (`level="L3"`, `request_changes`). Inductive `_rework_floor` detects `implement_level < active_floor`
+            #    and requires L4 for both `agent run` / `agent resume` and `branch verify` (cannot repeat L3!).
+            wt_upg = Path(_run_cli(["worktree", "create", "legacy-upgrade", *project])["path"])
+            (wt_upg / "calc.py").write_text("U = 1\n", encoding="utf-8")
+            _git(wt_upg, "commit", "-am", "feat: legacy upgrade")
+            upg_head = _git(wt_upg, "rev-parse", "HEAD")
+            rc_verdict = {
+                "codex": {
+                    "verdict": "request_changes",
+                    "summary": "Still broken",
+                    "blocking": ["Fix edge case"],
+                    "notes": [],
+                    "commands_run": [],
+                }
+            }
+            save_branch_state(repo / ".git", "task/legacy-upgrade", {
+                "branch": "task/legacy-upgrade",
+                "last_write": {
+                    "executor": "agy",
+                    "level": "L2",
+                    "recorded_at": "2026-11-20T10:00:00.000000+00:00",
+                },
+                "rounds": [
+                    {
+                        "head_sha": upg_head,
+                        "outcome": "request_changes",
+                        "dual": False,
+                        "level": "L2",
+                        "implement_level": "L2",
+                        "recorded_at": "2026-11-20T10:01:00.000000+00:00",
+                        "verdicts": rc_verdict,
+                    },
+                    {
+                        "head_sha": upg_head,
+                        "outcome": "request_changes",
+                        "dual": False,
+                        "level": "L3",
+                        "implement_level": "L2",  # Stale `implement_level` copied by old `main` on direct edit!
+                        "recorded_at": "2026-11-20T10:02:00.000000+00:00",
+                        "verdicts": rc_verdict,
+                    },
+                ],
+                "checks_by_sha": {},
+            })
+            run_upg = [
+                "agent", "run", *project, "--cwd", str(wt_upg), "--executor", "agy",
+                "--mode", "write", "--why", "Legacy upgrade rework", "--task", "Fix",
+            ]
+            verify_upg = ["branch", "verify", "legacy-upgrade", *project]
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                with self.assertRaisesRegex(KeelConfigError, "L4"):
+                    bg.prepare_branch_write(wt_upg, "write", "L3", defaults)
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*run_upg, "--level", "L3"])
+                with self.assertRaisesRegex(KeelConfigError, "L4"):
+                    bg.verify_branch(project=repo, branch_or_slug="legacy-upgrade", defaults=defaults, level="L3")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_upg, "--level", "L3"])
+                u_r3 = _run_cli(verify_upg)
+                self.assertEqual(u_r3["level"], "L4")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/legacy-upgrade")["rounds"][-1]["implement_level"]
+                )
+
+            # F) L1 write -> R1 L2 `request_changes` escalates rework & verify floor to L3 (no duplicate L2 review!),
+            #    preserving both L4 attempts (`L2 -> L3 -> L4 -> L4`, then 5th blocked at 2/2 L4 and 4/4 total).
+            wt_l1 = Path(_run_cli(["worktree", "create", "l1-start", *project])["path"])
+            (wt_l1 / "calc.py").write_text("L1_VAL = 1\n", encoding="utf-8")
+            _git(wt_l1, "commit", "-am", "feat: l1 start")
+            run_l1 = [
+                "agent", "run", *project, "--cwd", str(wt_l1), "--executor", "agy",
+                "--mode", "write", "--why", "L1 start ladder", "--task", "Impl",
+            ]
+            verify_l1 = ["branch", "verify", "l1-start", *project]
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([*run_l1, "--level", "L1"])
+                l1_r1 = _run_cli(verify_l1)
+                self.assertEqual(l1_r1["level"], "L2")
+                self.assertEqual(load_branch_state(repo / ".git", "task/l1-start")["rounds"][-1]["implement_level"], "L1")
+                # After L1 write fails L2 review, L2 rework AND L2 verify MUST be refused (floor is L3)
+                with self.assertRaisesRegex(KeelError, "L3"):
+                    _run_cli([*run_l1, "--level", "L2"])
+                with self.assertRaisesRegex(KeelError, "L3"):
+                    _run_cli([*verify_l1, "--level", "L2"])
+                _run_cli([*run_l1, "--level", "L3"])
+                l1_r2 = _run_cli(verify_l1)
+                self.assertEqual(l1_r2["level"], "L3")
+                _run_cli([*run_l1, "--level", "L4"])
+                l1_r3 = _run_cli(verify_l1)
+                self.assertEqual(l1_r3["level"], "L4")
+                _run_cli([*run_l1, "--level", "L4"])
+                l1_r4 = _run_cli(verify_l1)
+                self.assertEqual(l1_r4["level"], "L4")
+                with self.assertRaises(KeelError) as cap_l1:
+                    _run_cli(verify_l1)
+                self.assertIn("2/2 rejected rounds at L4", str(cap_l1.exception))
+                self.assertIn("4/4 total", str(cap_l1.exception))
+
+            # G) Direct-edit commit B made AFTER an `approve` round on commit A does NOT inherit A's `L2` `last_write`:
+            #    same-commit re-verify on A keeps `implement_level == "L2"`, whereas commit B gets `implement_level is None`
+            #    so an explicit `--level L4` rejection on B requires L4 for subsequent rework and verification.
+            wt_post_app = Path(_run_cli(["worktree", "create", "post-approve-edit", *project])["path"])
+            (wt_post_app / "calc.py").write_text("PA = 1\n", encoding="utf-8")
+            _git(wt_post_app, "commit", "-am", "feat: commit A")
+            sha_a = _git(wt_post_app, "rev-parse", "HEAD")
+            run_pa = [
+                "agent", "run", *project, "--cwd", str(wt_post_app), "--executor", "agy",
+                "--mode", "write", "--why", "Post-approve direct edit", "--task", "Impl",
+            ]
+            verify_pa = ["branch", "verify", "post-approve-edit", *project]
+            pa_outcome = "approve"
+
+            def pa_exec(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier(pa_outcome)(adapter, req, cfg)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", pa_exec),
+                  mock.patch.object(CodexExecutor, "execute", pa_exec)):
+                _run_cli([*run_pa, "--level", "L2"])
+                self.assertEqual(load_branch_state(repo / ".git", "task/post-approve-edit")["last_write"]["head_sha"], sha_a)
+                pa_r1 = _run_cli(verify_pa)
+                self.assertEqual((pa_r1["outcome"], pa_r1["level"]), ("approve", "L2"))
+                # Re-verifying the SAME approved commit A preserves `implement_level == "L2"`
+                pa_same = _run_cli([*verify_pa, "--level", "L3"])
+                self.assertEqual(pa_same["outcome"], "approve")
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/post-approve-edit")["rounds"][-1]["implement_level"],
+                    "L2",
+                )
+                # Direct edit commit B (without `keel agent run`) invalidates stale `last_write` from commit A!
+                (wt_post_app / "calc.py").write_text("PA = 2\n", encoding="utf-8")
+                _git(wt_post_app, "commit", "-am", "fix: direct edit commit B")
+                pa_outcome = "request_changes"
+                pa_b_r1 = _run_cli([*verify_pa, "--level", "L4"])
+                self.assertEqual(pa_b_r1["level"], "L4")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/post-approve-edit")["rounds"][-1]["implement_level"]
+                )
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*run_pa, "--level", "L3"])
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_pa, "--level", "L3"])
+                pa_b_r2 = _run_cli(verify_pa)
+                self.assertEqual(pa_b_r2["level"], "L4")
+
+            # H) Reduced ladder (`levels: ["L1", "L2"]`, `verify_min_level: "L2"`, `max_review_rounds: 2`,
+            #    with executor mappings ONLY for L1/L2): omitted `--level` selects L2 (never missing L3!) and caps at 2/2.
+            from keel_lib.executors.base import resolve_executor_level_config
+
+            wt_red = Path(_run_cli(["worktree", "create", "reduced-ladder", *project])["path"])
+            (wt_red / "calc.py").write_text("RED = 1\n", encoding="utf-8")
+            _git(wt_red, "commit", "-am", "feat: reduced ladder")
+            reduced_defaults = {
+                "default_branches": ["main", "master"],
+                "max_review_rounds": 2,
+                "levels": ["L1", "L2"],
+                "verify_min_level": "L2",
+                "routing": {"general": "agy", "implement": "agy", "verify": "codex"},
+                "executors": {
+                    "codex": {
+                        "levels": {
+                            "L1": {"model": "test-sol", "effort": "medium"},
+                            "L2": {"model": "test-sol", "effort": "max"},
+                        }
+                    },
+                    "agy": {
+                        "levels": {
+                            "L1": {"model": "test-h2"},
+                            "L2": {"model": "test-neon"},
+                        }
+                    },
+                },
+            }
+
+            def strict_reduced_verify(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                lvl, model, _ = resolve_executor_level_config(adapter.name, req.level, cfg)
+                payload = {
+                    "verdict": "request_changes",
+                    "summary": "Needs fix",
+                    "blocking": ["Fix bug"],
+                    "notes": [],
+                    "commands_run": [],
+                }
+                req.output_path.write_text(json.dumps(payload), encoding="utf-8")
+                return {"status": "completed", "executor": adapter.name, "level": lvl, "model": model}
+
+            with mock.patch.object(CodexExecutor, "execute", strict_reduced_verify):
+                red_r1 = bg.verify_branch(project=repo, branch_or_slug="reduced-ladder", defaults=reduced_defaults)
+                self.assertEqual(red_r1["level"], "L2")
+                red_r2 = bg.verify_branch(project=repo, branch_or_slug="reduced-ladder", defaults=reduced_defaults)
+                self.assertEqual(red_r2["level"], "L2")
+                with self.assertRaises(KeelError) as cap_red:
+                    bg.verify_branch(project=repo, branch_or_slug="reduced-ladder", defaults=reduced_defaults)
+                self.assertIn("2/2 rejected rounds at L2", str(cap_red.exception))
+                self.assertIn("2/2 total", str(cap_red.exception))
+                # Legacy round lacking `"level"` on reduced ladder uses `L2` baseline (never unconfigured `L3`)
+                legacy_no_lvl = [{"head_sha": sha_a, "outcome": "request_changes", "verdicts": rc_verdict}]
+                self.assertEqual(bg._rework_floor(legacy_no_lvl, levels=["L1", "L2"], verify_min_level="L2"), "L2")
+                self.assertEqual(
+                    bg._convergence_cap_status(legacy_no_lvl, max_review_rounds=2, levels=["L1", "L2"], verify_min_level="L2")["top_request_changes"],
+                    1,
+                )
+
+            # I) Direct edit BEFORE first review (or after rework write): L2 agent commits A, direct edit commits B != A,
+            #    R1 verify on B rejects at L3 -> `implement_level` is None, L3 rework is refused, and R2 runs at L4.
+            wt_pre = Path(_run_cli(["worktree", "create", "pre-review-direct-edit", *project])["path"])
+            (wt_pre / "calc.py").write_text("PRE = 1\n", encoding="utf-8")
+            _git(wt_pre, "commit", "-am", "feat: agent commit A")
+            run_pre = [
+                "agent", "run", *project, "--cwd", str(wt_pre), "--executor", "agy",
+                "--mode", "write", "--why", "Pre-review direct edit", "--task", "Impl",
+            ]
+            verify_pre = ["branch", "verify", "pre-review-direct-edit", *project]
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", write_exec)):
+                _run_cli([*run_pre, "--level", "L2"])
+                # Direct edit commit B BEFORE any verification round runs
+                (wt_pre / "calc.py").write_text("PRE = 2\n", encoding="utf-8")
+                _git(wt_pre, "commit", "-am", "fix: direct edit commit B before R1")
+                pre_r1 = _run_cli(verify_pre)
+                self.assertEqual(pre_r1["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/pre-review-direct-edit")["rounds"][-1]["implement_level"]
+                )
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*run_pre, "--level", "L3"])
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_pre, "--level", "L3"])
+                pre_r2 = _run_cli(verify_pre)
+                self.assertEqual(pre_r2["level"], "L4")
+
+            # J) Non-contiguous / altered ladders snap `minimum` to the lowest configured tier in `verify_tiers`:
+            #    1) `levels: ["L1", "L3", "L4"]`, `verify_min_level: "L2"` + `L1` write -> implicit verify selects `L3`
+            wt_gap = Path(_run_cli(["worktree", "create", "gap-ladder", *project])["path"])
+            (wt_gap / "calc.py").write_text("GAP = 1\n", encoding="utf-8")
+            _git(wt_gap, "commit", "-am", "feat: gap ladder")
+            gap_l1_l3_l4 = {
+                "default_branches": ["main", "master"],
+                "max_review_rounds": 2,
+                "levels": ["L1", "L3", "L4"],
+                "verify_min_level": "L2",
+                "routing": {"general": "agy", "implement": "agy", "verify": "codex"},
+                "executors": {
+                    "codex": {
+                        "levels": {
+                            "L1": {"model": "test-sol", "effort": "medium"},
+                            "L3": {"model": "test-astra", "effort": "high"},
+                            "L4": {"model": "test-astra", "effort": "xhigh"},
+                        }
+                    },
+                    "agy": {
+                        "levels": {
+                            "L1": {"model": "test-h2"},
+                            "L3": {"model": "test-neon-hi"},
+                            "L4": {"model": "test-carbon"},
+                        }
+                    },
+                },
+            }
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", strict_reduced_verify)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_gap), "--executor", "agy",
+                    "--mode", "write", "--level", "L1", "--why", "Gap ladder", "--task", "Impl",
+                ])
+                gap_r1 = bg.verify_branch(project=repo, branch_or_slug="gap-ladder", defaults=gap_l1_l3_l4)
+                self.assertEqual(gap_r1["level"], "L3")
+
+            #    2) Existing `L3` write on branch after `"L3"` is removed (`levels: ["L1", "L2", "L4"]`) -> selects `L4`
+            wt_alt = Path(_run_cli(["worktree", "create", "altered-ladder", *project])["path"])
+            (wt_alt / "calc.py").write_text("ALT = 1\n", encoding="utf-8")
+            _git(wt_alt, "commit", "-am", "feat: altered ladder")
+            altered_l1_l2_l4 = {
+                "default_branches": ["main", "master"],
+                "max_review_rounds": 2,
+                "levels": ["L1", "L2", "L4"],
+                "verify_min_level": "L2",
+                "routing": {"general": "agy", "implement": "agy", "verify": "codex"},
+                "executors": {
+                    "codex": {
+                        "levels": {
+                            "L1": {"model": "test-sol", "effort": "medium"},
+                            "L2": {"model": "test-sol", "effort": "max"},
+                            "L4": {"model": "test-astra", "effort": "xhigh"},
+                        }
+                    },
+                    "agy": {
+                        "levels": {
+                            "L1": {"model": "test-h2"},
+                            "L2": {"model": "test-neon"},
+                            "L4": {"model": "test-carbon"},
+                        }
+                    },
+                },
+            }
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", strict_reduced_verify)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_alt), "--executor", "agy",
+                    "--mode", "write", "--level", "L3", "--why", "Altered ladder", "--task", "Impl",
+                ])
+                alt_r1 = bg.verify_branch(project=repo, branch_or_slug="altered-ladder", defaults=altered_l1_l2_l4)
+                self.assertEqual(alt_r1["level"], "L4")
+
+            # K) Scope-mismatched approval when convergence cap is reached surfaces BOTH blockers:
+            #    stacked child hits 2 L4 rejections + `--force-round` approve against `task/stack-parent`;
+            #    `branch status --base task/stack-parent` is `ready_to_land: True`, whereas `--base main`
+            #    reports BOTH scope mismatch AND convergence cap (including on `--old-base`/`--old-head`).
+            wt_sp = Path(_run_cli(["worktree", "create", "stack-parent", *project])["path"])
+            (wt_sp / "parent_mod.py").write_text("P = 1\n", encoding="utf-8")
+            _git(wt_sp, "add", "parent_mod.py")
+            _git(wt_sp, "commit", "-m", "feat: stack parent")
+            sp_sha = _git(wt_sp, "rev-parse", "HEAD")
+
+            wt_sc = Path(_run_cli(["worktree", "create", "stack-child", "--base", "task/stack-parent", *project])["path"])
+            (wt_sc / "child_mod.py").write_text("C = 1\n", encoding="utf-8")
+            _git(wt_sc, "add", "child_mod.py")
+            _git(wt_sc, "commit", "-m", "feat: stack child")
+            sc_old_sha = _git(wt_sc, "rev-parse", "HEAD")
+            verify_sc = ["branch", "verify", "stack-child", "--base", "task/stack-parent", *project]
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                _run_cli([*verify_sc, "--level", "L4"])
+                _run_cli([*verify_sc, "--level", "L4"])
+            with mock.patch.object(CodexExecutor, "execute", verifier("approve")):
+                _run_cli([*verify_sc, "--level", "L4", "--force-round"])
+
+            st_parent = _run_cli(["branch", "status", "stack-child", "--base", "task/stack-parent", *project])
+            self.assertTrue(st_parent["ready_to_land"], st_parent["blockers"])
+
+            st_main = _run_cli(["branch", "status", "stack-child", "--base", "main", *project])
+            self.assertFalse(st_main["ready_to_land"])
+            self.assertTrue(any("merge-base" in b for b in st_main["blockers"]))
+            self.assertTrue(any("convergence cap" in b.lower() for b in st_main["blockers"]))
+            self.assertFalse(any("force-round" in b.lower() for b in st_main["blockers"]))
+
+            # Also check `--old-base`/`--old-head` scope mismatch when task criteria changed after cap + forced approve
+            (wt_sp / "docs/tasks/active/20261117-stepup.md").write_text(
+                "# Feature stepup\n\n## Goal & Why\nTightened.\n\n## Bounds\nstrict.\n\n## Done-check\ntrue\n",
+                encoding="utf-8",
+            )
+            _git(wt_sp, "add", "docs/tasks/active/20261117-stepup.md")
+            _git(wt_sp, "commit", "-m", "docs(tasks): tighten stepup spec on parent")
+            _git(wt_sc, "rebase", "task/stack-parent")
+            land_mismatch = _run_cli([
+                "branch", "land", "stack-child", "--base", "task/stack-parent", *project,
+                "--task-file", "docs/tasks/active/20261117-stepup.md",
+                "--old-base", sp_sha, "--old-head", sc_old_sha,
+            ])
+            self.assertFalse(land_mismatch["ready_to_land"])
+            self.assertTrue(any("revised task criteria" in b for b in land_mismatch["blockers"]))
+            self.assertTrue(any("convergence cap" in b.lower() for b in land_mismatch["blockers"]))
+
+            # L) Same-SHA re-verification after rejection + subsequent approval preserves known `last_write` floor:
+            #    L4 writer commits A -> L4 rejection on A -> L4 approval on same A -> `verify --dual` on A selects L4
+            #    and `verify --level L2` on A is refused requiring L4.
+            wt_same = Path(_run_cli(["worktree", "create", "same-sha-rc-approve", *project])["path"])
+            (wt_same / "calc.py").write_text("SAME = 1\n", encoding="utf-8")
+            _git(wt_same, "commit", "-am", "feat: L4 commit A")
+            run_same = [
+                "agent", "run", *project, "--cwd", str(wt_same), "--executor", "agy",
+                "--mode", "write", "--why", "Same SHA floor", "--task", "Impl",
+            ]
+            verify_same = ["branch", "verify", "same-sha-rc-approve", *project]
+            same_outcome = "request_changes"
+
+            def same_exec(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier(same_outcome)(adapter, req, cfg)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", same_exec),
+                  mock.patch.object(CodexExecutor, "execute", same_exec)):
+                _run_cli([*run_same, "--level", "L4"])
+                sm_r1 = _run_cli(verify_same)
+                self.assertEqual((sm_r1["outcome"], sm_r1["level"]), ("request_changes", "L4"))
+                same_outcome = "approve"
+                sm_r2 = _run_cli(verify_same)
+                self.assertEqual((sm_r2["outcome"], sm_r2["level"]), ("approve", "L4"))
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_same, "--level", "L2"])
+                sm_dual = _run_cli([*verify_same, "--dual"])
+                self.assertEqual((sm_dual["outcome"], sm_dual["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/same-sha-rc-approve")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+                # Message-only `--amend` (`A -> A'`) after `request_changes -> approve` STILL preserves `L4` floor!
+                _git(wt_same, "commit", "--amend", "-m", "feat: L4 commit A reworded after rc+approve")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_same, "--level", "L2"])
+                sm_reword = _run_cli(verify_same)
+                self.assertEqual((sm_reword["outcome"], sm_reword["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/same-sha-rc-approve")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+            # M) Pending L4 write when L4 is removed from configured `levels` (`["L1", "L2", "L3"]`) raises
+            #    `KeelConfigError` instead of silently downgrading verification to L3!
+            wt_ceil = Path(_run_cli(["worktree", "create", "ceil-overflow", *project])["path"])
+            (wt_ceil / "calc.py").write_text("CEIL = 1\n", encoding="utf-8")
+            _git(wt_ceil, "commit", "-am", "feat: L4 write before cap")
+            capped_l1_l2_l3 = {
+                "default_branches": ["main", "master"],
+                "max_review_rounds": 2,
+                "levels": ["L1", "L2", "L3"],
+                "verify_min_level": "L2",
+                "routing": {"general": "agy", "implement": "agy", "verify": "codex"},
+                "executors": {
+                    "codex": {
+                        "levels": {
+                            "L1": {"model": "test-sol", "effort": "medium"},
+                            "L2": {"model": "test-sol", "effort": "max"},
+                            "L3": {"model": "test-astra", "effort": "high"},
+                        }
+                    },
+                    "agy": {
+                        "levels": {
+                            "L1": {"model": "test-h2"},
+                            "L2": {"model": "test-neon"},
+                            "L3": {"model": "test-neon-hi"},
+                        }
+                    },
+                },
+            }
+            with (mock.patch.object(AgyExecutor, "execute", write_exec),
+                  mock.patch.object(CodexExecutor, "execute", strict_reduced_verify)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_ceil), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "L4 write", "--task", "Impl",
+                ])
+                with self.assertRaisesRegex(KeelConfigError, "L4"):
+                    bg.verify_branch(project=repo, branch_or_slug="ceil-overflow", defaults=capped_l1_l2_l3)
+
+            # N) Independent `total_rc >= max_total_rounds` Canary test (`1/2` at L4, `4/4` total):
+            #    L2 reject -> L3 approve -> new commit -> L2 reject -> L3 reject -> L4 reject (only 1 L4 rejection!).
+            #    Both `branch status` and `branch verify` report convergence cap (`1/2` at L4, `4/4` total) and block 5th verify!
+            wt_tot = Path(_run_cli(["worktree", "create", "total-cap-only", *project])["path"])
+            (wt_tot / "calc.py").write_text("TOT = 1\n", encoding="utf-8")
+            _git(wt_tot, "commit", "-am", "feat: total cap commit 1")
+            run_tot = [
+                "agent", "run", *project, "--cwd", str(wt_tot), "--executor", "agy",
+                "--mode", "write", "--why", "Total cap independent", "--task", "Impl",
+            ]
+            verify_tot = ["branch", "verify", "total-cap-only", *project]
+            tot_outcome = "request_changes"
+
+            def tot_exec(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier(tot_outcome)(adapter, req, cfg)
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", tot_exec),
+                  mock.patch.object(CodexExecutor, "execute", tot_exec)):
+                _run_cli([*run_tot, "--level", "L2"])
+                self.assertEqual(_run_cli(verify_tot)["level"], "L2")  # rc #1 (L2)
+                tot_outcome = "approve"
+                _run_cli([*run_tot, "--level", "L3"])
+                self.assertEqual(_run_cli(verify_tot)["outcome"], "approve")  # resets active floor
+                (wt_tot / "calc.py").write_text("TOT = 2\n", encoding="utf-8")
+                _git(wt_tot, "commit", "-am", "feat: total cap commit 2")
+                tot_outcome = "request_changes"
+                _run_cli([*run_tot, "--level", "L2"])
+                self.assertEqual(_run_cli(verify_tot)["level"], "L2")  # rc #2 (L2)
+                _run_cli([*run_tot, "--level", "L3"])
+                self.assertEqual(_run_cli(verify_tot)["level"], "L3")  # rc #3 (L3)
+                _run_cli([*run_tot, "--level", "L4"])
+                self.assertEqual(_run_cli(verify_tot)["level"], "L4")  # rc #4 (L4: 1/2 top, 4/4 total!)
+
+                st_tot = _run_cli(["branch", "status", "total-cap-only", *project])
+                self.assertFalse(st_tot["ready_to_land"])
+                self.assertTrue(any("1/2 rejected rounds at L4" in b and "4/4 total" in b for b in st_tot["blockers"]))
+                with self.assertRaises(KeelError) as cap_tot:
+                    _run_cli(verify_tot)
+                self.assertIn("1/2 rejected rounds at L4", str(cap_tot.exception))
+                self.assertIn("4/4 total", str(cap_tot.exception))
+                self.assertNotIn("force-round", str(cap_tot.exception).lower())
+                tot_outcome = "approve"
+                forced_tot = _run_cli([*verify_tot, "--force-round"])
+                self.assertEqual((forced_tot["outcome"], forced_tot["forced_round"]), ("approve", True))
+                self.assertTrue(_run_cli(["branch", "status", "total-cap-only", *project])["ready_to_land"])
+
+            # O) Staged / uncommitted writer output (`pending_tree_shas`) preserves writer tier when committed untouched,
+            #    without mutating `.git/index` or `.git/objects`, and drops attribution if modified before commit!
+            wt_stg = Path(_run_cli(["worktree", "create", "staged-writer", *project])["path"])
+            verify_stg = ["branch", "verify", "staged-writer", *project]
+
+            def uncommitted_l4_writer(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("approve")(adapter, req, cfg)
+                (req.workdir / "calc.py").write_text("STAGED_L4 = 42\n", encoding="utf-8")
+                (req.workdir / "helper_l4.py").write_text("H = 1\n", encoding="utf-8")
+                _git(req.workdir, "add", "calc.py")  # `calc.py` staged, `helper_l4.py` untracked!
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", uncommitted_l4_writer),
+                  mock.patch.object(CodexExecutor, "execute", uncommitted_l4_writer)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_stg), "--executor", "agy",
+                    "--preset", "general", "--mode", "write", "--level", "L4",
+                    "--why", "Staged L4 output", "--task", "Write code without committing",
+                ])
+                # Confirm index was NOT mutated (`helper_l4.py` is still untracked `??`)
+                porcelain_stg = _git(wt_stg, "status", "--porcelain", "-uall")
+                self.assertIn("?? helper_l4.py", porcelain_stg)
+                saved_stg = load_branch_state(repo / ".git", "task/staged-writer")["last_write"]
+                self.assertEqual(len(saved_stg["pending_tree_shas"]), 2)
+                # Caller stages all and commits the exact writer output untouched -> L4 floor preserved!
+                _git(wt_stg, "add", "-A")
+                _git(wt_stg, "commit", "-m", "feat: commit writer output untouched")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_stg, "--level", "L2"])
+                stg_v1 = _run_cli(verify_stg)
+                self.assertEqual(stg_v1["level"], "L4")
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/staged-writer")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+                # Conversely, if writer leaves uncommitted output and caller modifies it before committing -> drops L4!
+                wt_mod = Path(_run_cli(["worktree", "create", "modified-writer", *project])["path"])
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_mod), "--executor", "agy",
+                    "--preset", "general", "--mode", "write", "--level", "L4",
+                    "--why", "Modified output", "--task", "Write code",
+                ])
+                (wt_mod / "calc.py").write_text("MODIFIED_BY_CALLER = 99\n", encoding="utf-8")
+                _git(wt_mod, "add", "-A")
+                _git(wt_mod, "commit", "-m", "feat: caller edited writer output")
+                mod_v1 = _run_cli(["branch", "verify", "modified-writer", *project])
+                self.assertEqual(mod_v1["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/modified-writer")["rounds"][-1]["implement_level"]
+                )
+
+            # P) Legacy pre-upgrade `last_write` (no `head_sha`) after prior rejection, approved post-upgrade with
+            #    `implement_level="L4"` on commit A -> repeat `verify --dual` on A selects L4 and refuses `--level L2`.
+            wt_leg_app = Path(_run_cli(["worktree", "create", "legacy-post-approve", *project])["path"])
+            (wt_leg_app / "calc.py").write_text("LA = 1\n", encoding="utf-8")
+            _git(wt_leg_app, "commit", "-am", "feat: legacy L4 rework")
+            leg_sha = _git(wt_leg_app, "rev-parse", "HEAD")
+            save_branch_state(repo / ".git", "task/legacy-post-approve", {
+                "branch": "task/legacy-post-approve",
+                "last_write": {
+                    "executor": "agy",
+                    "level": "L4",
+                    "reworked_round": 1,
+                    "recorded_at": "2026-11-20T10:02:00.000000+00:00",
+                },
+                "rounds": [{
+                    "head_sha": leg_sha,
+                    "outcome": "request_changes",
+                    "dual": False,
+                    "level": "L3",
+                    "implement_level": "L3",
+                    "recorded_at": "2026-11-20T10:01:00.000000+00:00",
+                    "verdicts": rc_verdict,
+                }],
+                "checks_by_sha": {},
+            })
+            verify_leg_app = ["branch", "verify", "legacy-post-approve", *project]
+            with (mock.patch.object(AgyExecutor, "execute", verifier("approve")),
+                  mock.patch.object(CodexExecutor, "execute", verifier("approve"))):
+                la_r2 = _run_cli(verify_leg_app)
+                self.assertEqual((la_r2["outcome"], la_r2["level"]), ("approve", "L4"))
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_leg_app, "--level", "L2"])
+                la_dual = _run_cli([*verify_leg_app, "--dual"])
+                self.assertEqual((la_dual["outcome"], la_dual["level"]), ("approve", "L4"))
+
+            # Q) Removing L4 from `levels` after an L4 rejection -> both `prepare_branch_write` and `verify_branch`
+            #    raise `KeelConfigError`; and explicit `verify --level L3` when `levels=["L1", "L2", "L4"]` raises `KeelConfigError`.
+            wt_drop_l4 = Path(_run_cli(["worktree", "create", "drop-l4-after-rc", *project])["path"])
+            (wt_drop_l4 / "calc.py").write_text("DL4 = 1\n", encoding="utf-8")
+            _git(wt_drop_l4, "commit", "-am", "feat: L4 rejected")
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                _run_cli(["branch", "verify", "drop-l4-after-rc", "--level", "L4", *project])
+            with self.assertRaisesRegex(KeelConfigError, "L4"):
+                bg.prepare_branch_write(wt_drop_l4, "write", "L3", capped_l1_l2_l3)
+            with self.assertRaisesRegex(KeelConfigError, "L4"):
+                bg.verify_branch(project=repo, branch_or_slug="drop-l4-after-rc", defaults=capped_l1_l2_l3)
+            with self.assertRaisesRegex(KeelConfigError, "L3"):
+                bg.verify_branch(project=repo, branch_or_slug="altered-ladder", defaults=altered_l1_l2_l4, level="L3")
+
+            # R) Unstaged CRLF file written by L4 writer under temporary HOME with `core.autocrlf = input`,
+            #    committed unchanged by caller -> `_snapshot_pending_tree_shas` respects caller normalization and preserves L4!
+            fake_home = Path(tmp) / "crlf-home"
+            fake_home.mkdir()
+            subprocess.run(
+                ["git", "config", "--global", "core.autocrlf", "input"],
+                check=True,
+                capture_output=True,
+                env={**os.environ, "HOME": str(fake_home)},
+            )
+            wt_crlf = Path(_run_cli(["worktree", "create", "crlf-writer", *project])["path"])
+
+            def crlf_l4_writer(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("approve")(adapter, req, cfg)
+                (req.workdir / "crlf.py").write_bytes(b"LINE1 = 1\r\nLINE2 = 2\r\n")
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(fake_home)}),
+                mock.patch.object(AgyExecutor, "execute", crlf_l4_writer),
+                mock.patch.object(CodexExecutor, "execute", crlf_l4_writer),
+            ):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_crlf), "--executor", "agy",
+                    "--preset", "general", "--mode", "write", "--level", "L4",
+                    "--why", "CRLF normalization", "--task", "Write CRLF file",
+                ])
+                subprocess.run(
+                    ["git", "-C", str(wt_crlf), "add", "-A"],
+                    check=True,
+                    capture_output=True,
+                    env={**os.environ, "HOME": str(fake_home)},
+                )
+                subprocess.run(
+                    ["git", "-C", str(wt_crlf), "commit", "-m", "feat: commit normalized CRLF"],
+                    check=True,
+                    capture_output=True,
+                    env={**os.environ, "HOME": str(fake_home)},
+                )
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli(["branch", "verify", "crlf-writer", "--level", "L2", *project])
+                crlf_v = _run_cli(["branch", "verify", "crlf-writer", *project])
+                self.assertEqual(crlf_v["level"], "L4")
+
+            # S) Message-only `git commit --amend -m "reword"` on L4 writer commit preserves L4 floor
+            #    (including across subsequent `--dual` verify), while content-modifying `--amend` drops L4!
+            wt_amd = Path(_run_cli(["worktree", "create", "amend-reword", *project])["path"])
+            (wt_amd / "calc.py").write_text("AMD = 1\n", encoding="utf-8")
+            _git(wt_amd, "commit", "-am", "feat: L4 writer commit")
+            run_amd = [
+                "agent", "run", *project, "--cwd", str(wt_amd), "--executor", "agy",
+                "--mode", "write", "--why", "Amend reword", "--task", "Impl",
+            ]
+            verify_amd = ["branch", "verify", "amend-reword", *project]
+            with (mock.patch.object(AgyExecutor, "execute", same_exec),
+                  mock.patch.object(CodexExecutor, "execute", same_exec)):
+                same_outcome = "approve"
+                _run_cli([*run_amd, "--level", "L4"])
+                _git(wt_amd, "commit", "--amend", "-m", "feat: reworded message only")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_amd, "--level", "L2"])
+                amd_v1 = _run_cli(verify_amd)
+                self.assertEqual((amd_v1["outcome"], amd_v1["level"]), ("approve", "L4"))
+                amd_dual = _run_cli([*verify_amd, "--dual"])
+                self.assertEqual((amd_dual["outcome"], amd_dual["level"]), ("approve", "L4"))
+
+                # Rewording AGAIN *after* `approve` (`A' -> A''` with unchanged tree) requires fresh approval in
+                # `branch status`, STILL refuses `--level L2`, and selects `L4` on `branch verify`!
+                _git(wt_amd, "commit", "--amend", "-m", "feat: reworded after approval")
+                self.assertFalse(_run_cli(["branch", "status", "amend-reword", *project])["ready_to_land"])
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_amd, "--level", "L2"])
+                amd_post_app = _run_cli(verify_amd)
+                self.assertEqual((amd_post_app["outcome"], amd_post_app["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/amend-reword")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+                # Amending with modified file content *after* `approve` drops `L4` attribution!
+                (wt_amd / "calc.py").write_text("AMD = 2\n", encoding="utf-8")
+                _git(wt_amd, "commit", "-a", "--amend", "-m", "feat: content edit after approval")
+                amd_post_edit = _run_cli(verify_amd)
+                self.assertEqual(amd_post_edit["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/amend-reword")["rounds"][-1]["implement_level"]
+                )
+
+                # Amending with modified file content drops L4 attribution!
+                wt_amd_mod = Path(_run_cli(["worktree", "create", "amend-modified", *project])["path"])
+                (wt_amd_mod / "calc.py").write_text("AMD_MOD = 1\n", encoding="utf-8")
+                _git(wt_amd_mod, "commit", "-am", "feat: initial L4")
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_amd_mod), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Amend edit", "--task", "Impl",
+                ])
+                (wt_amd_mod / "calc.py").write_text("AMD_MOD = 2\n", encoding="utf-8")
+                _git(wt_amd_mod, "commit", "-a", "--amend", "-m", "feat: amended content")
+                amd_mod_v = _run_cli(["branch", "verify", "amend-modified", *project])
+                self.assertEqual(amd_mod_v["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/amend-modified")["rounds"][-1]["implement_level"]
+                )
+
+            # T) Historical L4 rejection resolved by L4 approval, followed by removing L4 from `levels` (`["L1", "L2", "L3"]`):
+            #    new commit rejected at L2 escalates cleanly to L3 rework & L3 verify without replaying resolved L4 round!
+            wt_hist = Path(_run_cli(["worktree", "create", "resolved-hist-l4", *project])["path"])
+            (wt_hist / "calc.py").write_text("HIST = 1\n", encoding="utf-8")
+            _git(wt_hist, "commit", "-am", "feat: hist 1")
+            verify_hist = ["branch", "verify", "resolved-hist-l4", *project]
+            with mock.patch.object(CodexExecutor, "execute", verifier("request_changes")):
+                _run_cli([*verify_hist, "--level", "L4"])
+            with mock.patch.object(CodexExecutor, "execute", verifier("approve")):
+                _run_cli([*verify_hist, "--level", "L4"])
+            (wt_hist / "calc.py").write_text("HIST = 2\n", encoding="utf-8")
+            _git(wt_hist, "commit", "-am", "feat: hist 2 after L4 removed")
+            with mock.patch.object(CodexExecutor, "execute", strict_reduced_verify):
+                hist_r3 = bg.verify_branch(
+                    project=repo, branch_or_slug="resolved-hist-l4", defaults=capped_l1_l2_l3, level="L2",
+                )
+                self.assertEqual(hist_r3["level"], "L2")
+                self.assertIsNotNone(bg.prepare_branch_write(wt_hist, "write", "L3", capped_l1_l2_l3))
+                hist_r4 = bg.verify_branch(project=repo, branch_or_slug="resolved-hist-l4", defaults=capped_l1_l2_l3)
+                self.assertEqual(hist_r4["level"], "L3")
+
+            # U) Staged L4 writer output committed unchanged as A -> L4 rejection on A -> L4 approval on A
+            #    (where R2 records `implement_level: None`) -> follow-up `verify --dual` STILL selects L4 and refuses L2!
+            wt_stg_rc = Path(_run_cli(["worktree", "create", "staged-rc-approve", *project])["path"])
+            verify_stg_rc = ["branch", "verify", "staged-rc-approve", *project]
+            stg_rc_outcome = "request_changes"
+
+            def staged_rc_exec(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier(stg_rc_outcome)(adapter, req, cfg)
+                (req.workdir / "calc.py").write_text("STAGED_RC_L4 = 7\n", encoding="utf-8")
+                _git(req.workdir, "add", "calc.py")
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", staged_rc_exec),
+                  mock.patch.object(CodexExecutor, "execute", staged_rc_exec)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_stg_rc), "--executor", "agy",
+                    "--preset", "general", "--mode", "write", "--level", "L4",
+                    "--why", "Staged rc->approve", "--task", "Stage changes",
+                ])
+                _git(wt_stg_rc, "commit", "-m", "feat: commit staged L4 output")
+                sr_r1 = _run_cli(verify_stg_rc)
+                self.assertEqual((sr_r1["outcome"], sr_r1["level"]), ("request_changes", "L4"))
+                stg_rc_outcome = "approve"
+                sr_r2 = _run_cli(verify_stg_rc)
+                self.assertEqual((sr_r2["outcome"], sr_r2["level"]), ("approve", "L4"))
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_stg_rc, "--level", "L2"])
+                sr_dual = _run_cli([*verify_stg_rc, "--dual"])
+                self.assertEqual((sr_dual["outcome"], sr_dual["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/staged-rc-approve")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+            # V) Legacy `main` ledger upgrade: L4 write (no `head_sha`) + L4 rejection on commit A recorded on `main`,
+            #    then upgraded -> L4 approve on same commit A (which records `implement_level: None`) ->
+            #    (a) `verify --dual` stays L4 and `verify --level L2` is rejected;
+            #    (b) message-only `git commit --amend -m` on approved legacy L4 commit still rejects `--level L2` and runs L4,
+            #        whereas a content-changing `--amend` drops L4 attribution back to manual baseline L3.
+            wt_leg_l4 = Path(_run_cli(["worktree", "create", "legacy-l4-rc-upgrade", *project])["path"])
+            (wt_leg_l4 / "calc.py").write_text("LEG_L4 = 1\n", encoding="utf-8")
+            _git(wt_leg_l4, "commit", "-am", "feat: legacy main L4 commit A")
+            leg_l4_sha = _git(wt_leg_l4, "rev-parse", "HEAD")
+            save_branch_state(repo / ".git", "task/legacy-l4-rc-upgrade", {
+                "branch": "task/legacy-l4-rc-upgrade",
+                "last_write": {
+                    "executor": "agy",
+                    "level": "L4",
+                    "recorded_at": "2026-11-20T09:00:00.000000+00:00",
+                },
+                "rounds": [{
+                    "head_sha": leg_l4_sha,
+                    "outcome": "request_changes",
+                    "dual": False,
+                    "level": "L4",
+                    "implement_level": "L4",
+                    "recorded_at": "2026-11-20T09:01:00.000000+00:00",
+                    "verdicts": rc_verdict,
+                }],
+                "checks_by_sha": {},
+            })
+            verify_leg_l4 = ["branch", "verify", "legacy-l4-rc-upgrade", *project]
+            with (mock.patch.object(AgyExecutor, "execute", verifier("approve")),
+                  mock.patch.object(CodexExecutor, "execute", verifier("approve"))):
+                # Post-upgrade approval on same commit A
+                leg_up_r2 = _run_cli(verify_leg_l4)
+                self.assertEqual((leg_up_r2["outcome"], leg_up_r2["level"]), ("approve", "L4"))
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_leg_l4, "--level", "L2"])
+                leg_up_dual = _run_cli([*verify_leg_l4, "--dual"])
+                self.assertEqual((leg_up_dual["outcome"], leg_up_dual["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/legacy-l4-rc-upgrade")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+                # Message-only `--amend` on approved legacy L4 commit still rejects `--level L2` and runs L4!
+                _git(wt_leg_l4, "commit", "--amend", "-m", "feat: reworded legacy L4 commit")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_leg_l4, "--level", "L2"])
+                leg_up_amd = _run_cli(verify_leg_l4)
+                self.assertEqual((leg_up_amd["outcome"], leg_up_amd["level"]), ("approve", "L4"))
+                # Content-changing `--amend` drops legacy L4 attribution to manual baseline L3!
+                (wt_leg_l4 / "calc.py").write_text("LEG_L4 = 2\n", encoding="utf-8")
+                _git(wt_leg_l4, "commit", "-a", "--amend", "-m", "feat: edited legacy L4 content")
+                leg_up_edit = _run_cli(verify_leg_l4)
+                self.assertEqual(leg_up_edit["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/legacy-l4-rc-upgrade")["rounds"][-1]["implement_level"]
+                )
+
+            # W) L4 writer commits its change AND leaves an untracked log file (`pending_tree_shas` non-empty);
+            #    after moving the untracked log aside, L4 `request_changes` -> L4 `approve` -> message-only
+            #    `git commit --amend -m "reword"` STILL preserves L4 (`verify --level L2` rejected, `verify --dual` L4),
+            #    whereas a content-changing `--amend` drops to L3!
+            wt_untrk = Path(_run_cli(["worktree", "create", "committed-plus-untracked", *project])["path"])
+            verify_untrk = ["branch", "verify", "committed-plus-untracked", *project]
+            untrk_outcome = "request_changes"
+
+            def committed_plus_untracked_l4(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier(untrk_outcome)(adapter, req, cfg)
+                (req.workdir / "calc.py").write_text("COMMITTED_L4 = 100\n", encoding="utf-8")
+                _git(req.workdir, "commit", "-am", "feat: L4 writer committed")
+                (req.workdir / "test.log").write_text("leftover log\n", encoding="utf-8")
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", committed_plus_untracked_l4),
+                  mock.patch.object(CodexExecutor, "execute", committed_plus_untracked_l4)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_untrk), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Committed + untracked log", "--task", "Impl",
+                ])
+                self.assertTrue(
+                    bool(load_branch_state(repo / ".git", "task/committed-plus-untracked")["last_write"]["pending_tree_shas"])
+                )
+                (wt_untrk / "test.log").unlink()
+                un_r1 = _run_cli(verify_untrk)
+                self.assertEqual((un_r1["outcome"], un_r1["level"]), ("request_changes", "L4"))
+                untrk_outcome = "approve"
+                un_r2 = _run_cli(verify_untrk)
+                self.assertEqual((un_r2["outcome"], un_r2["level"]), ("approve", "L4"))
+                _git(wt_untrk, "commit", "--amend", "-m", "feat: L4 writer reworded")
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_untrk, "--level", "L2"])
+                un_dual = _run_cli([*verify_untrk, "--dual"])
+                self.assertEqual((un_dual["outcome"], un_dual["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/committed-plus-untracked")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+                # Content-changing `--amend` drops to manual baseline L3
+                (wt_untrk / "calc.py").write_text("COMMITTED_L4 = 200\n", encoding="utf-8")
+                _git(wt_untrk, "commit", "-a", "--amend", "-m", "feat: content changed")
+                un_edit = _run_cli(verify_untrk)
+                self.assertEqual(un_edit["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/committed-plus-untracked")["rounds"][-1]["implement_level"]
+                )
+
+            # X) Tracked-only commit (`git commit -am` / `git add -u`) when writer modified tracked file AND left an
+            #    untracked log file (`tracked_tree_sha` in `pending_tree_shas`): removing the untracked log preserves L4!
+            wt_trk = Path(_run_cli(["worktree", "create", "tracked-only-commit", *project])["path"])
+            verify_trk = ["branch", "verify", "tracked-only-commit", *project]
+
+            def tracked_plus_untracked_l4(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("approve")(adapter, req, cfg)
+                (req.workdir / "calc.py").write_text("TRACKED_ONLY_L4 = 77\n", encoding="utf-8")
+                (req.workdir / "scratch.log").write_text("untracked debug output\n", encoding="utf-8")
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", tracked_plus_untracked_l4),
+                  mock.patch.object(CodexExecutor, "execute", tracked_plus_untracked_l4)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_trk), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Tracked-only commit", "--task", "Impl",
+                ])
+                # Confirm real index was NOT mutated (`calc.py` unstaged, `scratch.log` untracked `??`)
+                self.assertEqual(_git(wt_trk, "diff", "--cached", "--name-only"), "")
+                self.assertEqual(_git(wt_trk, "diff", "--name-only"), "calc.py")
+                self.assertIn("?? scratch.log", _git(wt_trk, "status", "--porcelain", "-uall"))
+                saved_trk = load_branch_state(repo / ".git", "task/tracked-only-commit")["last_write"]
+                self.assertEqual(len(saved_trk["pending_tree_shas"]), 2)
+                _git(wt_trk, "commit", "-am", "feat: commit tracked writer changes only")
+                (wt_trk / "scratch.log").unlink()
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_trk, "--level", "L2"])
+                trk_v1 = _run_cli(verify_trk)
+                self.assertEqual((trk_v1["outcome"], trk_v1["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/tracked-only-commit")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+
+                # Modifying tracked file before `git commit -am` + removing untracked log drops to manual baseline L3
+                wt_trk_mod = Path(_run_cli(["worktree", "create", "tracked-only-modified", *project])["path"])
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_trk_mod), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Tracked-only modified", "--task", "Impl",
+                ])
+                (wt_trk_mod / "calc.py").write_text("TRACKED_EDITED_BY_CALLER = 88\n", encoding="utf-8")
+                _git(wt_trk_mod, "commit", "-am", "feat: caller edited tracked file")
+                (wt_trk_mod / "scratch.log").unlink()
+                trk_mod_v = _run_cli(["branch", "verify", "tracked-only-modified", *project])
+                self.assertEqual(trk_mod_v["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/tracked-only-modified")["rounds"][-1]["implement_level"]
+                )
+
+            # Y) Pure rebase of writer commit onto advanced `main` before (and after) review preserves L4 floor,
+            #    including tracked-only committed writer output AND legacy anchor commits, whereas modifying content
+            #    during/after rebase drops attribution to manual baseline L3!
+            wt_reb = Path(_run_cli(["worktree", "create", "rebased-writer", *project])["path"])
+            wt_reb_mod = Path(_run_cli(["worktree", "create", "rebased-modified", *project])["path"])
+            wt_reb_trk = Path(_run_cli(["worktree", "create", "rebased-tracked-pending", *project])["path"])
+            wt_reb_leg = Path(_run_cli(["worktree", "create", "rebased-legacy-anchor", *project])["path"])
+            old_main_sha = _git(repo, "rev-parse", "HEAD")
+
+            def committed_l4_writer(adapter: Any, req: Any, cfg: Any) -> dict[str, Any]:
+                if req.preset == "verify":
+                    return verifier("approve")(adapter, req, cfg)
+                (req.workdir / "calc.py").write_text("REBASED_L4 = 314\n", encoding="utf-8")
+                _git(req.workdir, "commit", "-am", "feat: L4 writer commit before rebase")
+                return {"status": "completed", "output_path": str(req.output_path), "level": req.level}
+
+            with (mock.patch.object(AgyExecutor, "execute", committed_l4_writer),
+                  mock.patch.object(CodexExecutor, "execute", committed_l4_writer)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_reb), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Pure rebase writer", "--task", "Impl",
+                ])
+                old_reb_head = _git(wt_reb, "rev-parse", "HEAD")
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_reb_mod), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Modified rebase writer", "--task", "Impl",
+                ])
+
+            with (mock.patch.object(AgyExecutor, "execute", tracked_plus_untracked_l4),
+                  mock.patch.object(CodexExecutor, "execute", tracked_plus_untracked_l4)):
+                _run_cli([
+                    "agent", "run", *project, "--cwd", str(wt_reb_trk), "--executor", "agy",
+                    "--mode", "write", "--level", "L4", "--why", "Tracked pending + rebase", "--task", "Impl",
+                ])
+                _git(wt_reb_trk, "commit", "-am", "feat: commit tracked writer changes before rebase")
+                (wt_reb_trk / "scratch.log").unlink()
+
+            (wt_reb_leg / "calc.py").write_text("LEGACY_REB = 1\n", encoding="utf-8")
+            _git(wt_reb_leg, "commit", "-am", "feat: legacy L4 anchor before rebase")
+            leg_reb_sha = _git(wt_reb_leg, "rev-parse", "HEAD")
+            save_branch_state(repo / ".git", "task/rebased-legacy-anchor", {
+                "branch": "task/rebased-legacy-anchor",
+                "last_write": {
+                    "executor": "agy",
+                    "level": "L4",
+                    "recorded_at": "2026-11-20T09:00:00.000000+00:00",
+                },
+                "rounds": [{
+                    "head_sha": leg_reb_sha,
+                    "outcome": "approve",
+                    "dual": False,
+                    "level": "L4",
+                    "implement_level": "L4",
+                    "recorded_at": "2026-11-20T09:01:00.000000+00:00",
+                    "verdicts": {"codex": {"verdict": "approve", "summary": "ok", "blocking": [], "notes": [], "commands_run": []}},
+                }],
+                "checks_by_sha": {},
+            })
+
+            # Advance `main` with an unrelated file commit and rebase all four task branches onto `main`
+            (repo / "unrelated_main.txt").write_text("main advanced\n", encoding="utf-8")
+            _git(repo, "add", "unrelated_main.txt")
+            _git(repo, "commit", "-m", "docs: advance main with unrelated file")
+            new_main_sha = _git(repo, "rev-parse", "HEAD")
+
+            _git(wt_reb, "rebase", "main")
+            new_reb_head = _git(wt_reb, "rev-parse", "HEAD")
+            cmp_reb = _run_cli([
+                "branch", "compare", *project,
+                "--old-base", old_main_sha, "--old-head", old_reb_head,
+                "--base", new_main_sha, "--head", new_reb_head,
+            ])
+            self.assertTrue(cmp_reb["ok"])
+
+            _git(wt_reb_mod, "rebase", "main")
+            (wt_reb_mod / "calc.py").write_text("REBASED_EDITED_BY_CALLER = 999\n", encoding="utf-8")
+            _git(wt_reb_mod, "commit", "-a", "--amend", "-m", "feat: caller modified content after rebase")
+
+            _git(wt_reb_trk, "rebase", "main")
+            _git(wt_reb_leg, "rebase", "main")
+
+            verify_reb = ["branch", "verify", "rebased-writer", *project]
+            with (mock.patch.object(AgyExecutor, "execute", verifier("approve")),
+                  mock.patch.object(CodexExecutor, "execute", verifier("approve"))):
+                # (a) Pure rebase of committed L4 writer -> `--level L2` rejected, defaults to `L4`, and `--dual` stays `L4`
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_reb, "--level", "L2"])
+                reb_v1 = _run_cli(verify_reb)
+                self.assertEqual((reb_v1["outcome"], reb_v1["level"]), ("approve", "L4"))
+                self.assertEqual(
+                    load_branch_state(repo / ".git", "task/rebased-writer")["rounds"][-1]["implement_level"],
+                    "L4",
+                )
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli([*verify_reb, "--level", "L2"])
+                reb_dual = _run_cli([*verify_reb, "--dual"])
+                self.assertEqual((reb_dual["outcome"], reb_dual["level"]), ("approve", "L4"))
+
+                # (b) Modifying tracked content during/after rebase drops attribution to manual baseline `L3`
+                reb_mod_v = _run_cli(["branch", "verify", "rebased-modified", *project])
+                self.assertEqual(reb_mod_v["level"], "L3")
+                self.assertIsNone(
+                    load_branch_state(repo / ".git", "task/rebased-modified")["rounds"][-1]["implement_level"]
+                )
+
+                # (c) Tracked-only commit (`git commit -am` + clean untracked) + pure rebase onto `main` -> stays `L4`
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli(["branch", "verify", "rebased-tracked-pending", "--level", "L2", *project])
+                reb_trk_v = _run_cli(["branch", "verify", "rebased-tracked-pending", *project])
+                self.assertEqual((reb_trk_v["outcome"], reb_trk_v["level"]), ("approve", "L4"))
+
+                # (d) Legacy anchor commit purely rebased onto `main` -> `--level L2` rejected, defaults to `L4`
+                with self.assertRaisesRegex(KeelError, "L4"):
+                    _run_cli(["branch", "verify", "rebased-legacy-anchor", "--level", "L2", *project])
+                reb_leg_v = _run_cli(["branch", "verify", "rebased-legacy-anchor", *project])
+                self.assertEqual((reb_leg_v["outcome"], reb_leg_v["level"]), ("approve", "L4"))
 
 
 if __name__ == "__main__":

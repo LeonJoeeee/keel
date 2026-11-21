@@ -806,6 +806,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             "lock non-trivial stacked specs in `docs/tasks/todo/<YYYYMMDD>-<slug>.md` on `main` before branching the stack and pass `--task-file`",
             "never mutate an already-verified parent branch",
             "Verify each slice before advancing or landing (R3, P4).",
+            "Stop after two rejected L4 rounds—at most 4 rounds from L2 (`L2 -> L3 -> L4 -> L4`), 3 from L3 (`L3 -> L4 -> L4`), or 2 from L4 (`L4 -> L4`)",
             "standing execution or landing delegation never authorizes `--force-round`, which requires explicit human authorization for that specific escalation",
             "keel branch verify <slug> [--base <ref>] [--task-file <file>] [--why <why>] [--context-file <file>] [--level <level>]",
             "keel branch status [<slug>] [--base <ref>]",

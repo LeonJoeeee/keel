@@ -179,7 +179,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         save_run_record(run_dir, {**record, **exc.partial})
         raise
     save_run_record(run_dir, record)
-    record_branch_write(write_target, adapter.name, record)
+    record_branch_write(write_target, adapter.name, record, defaults=defaults)
     return record
 
 
@@ -216,7 +216,7 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
         record["level"] = level
     record.update(res)
     save_run_record(run_dir, record)
-    record_branch_write(write_target, adapter.name, record)
+    record_branch_write(write_target, adapter.name, record, defaults=defaults)
     return record
 
 
@@ -250,12 +250,16 @@ def _cmd_branch_status(args: argparse.Namespace) -> dict[str, Any]:
     defaults = load_defaults()
     proj = git_toplevel(args.project or Path.cwd())
     max_rounds = int(defaults.get("max_review_rounds", 2))
+    levels = tuple(defaults.get("levels", ("L1", "L2", "L3", "L4")))
+    verify_min_level = str(defaults.get("verify_min_level", "L2"))
     default_branches = defaults.get("default_branches", ["main", "master"])
     if not args.branch:
         return branch_repo_overview(
             proj,
             base=args.base,
             max_review_rounds=max_rounds,
+            levels=levels,
+            verify_min_level=verify_min_level,
             default_branches=default_branches,
         )
     return evaluate_branch_gate(
@@ -263,6 +267,8 @@ def _cmd_branch_status(args: argparse.Namespace) -> dict[str, Any]:
         args.branch,
         base=args.base,
         max_review_rounds=max_rounds,
+        levels=levels,
+        verify_min_level=verify_min_level,
         default_branches=default_branches,
     )
 

@@ -28,8 +28,11 @@ from keel_lib.context import (  # noqa: E402
     assemble_brief,
     generate_run_id,
     load_run_record,
+    read_utf8_file,
+    resolve_why,
     runs_root_dir,
     save_run_record,
+    trim_markdown_block,
 )
 from keel_lib.env import is_disposable_verify_path, run_cmd, safe_resolve  # noqa: E402
 from keel_lib.executors import EXECUTORS, RunRequest, get_executor  # noqa: E402
@@ -93,6 +96,10 @@ def _cmd_worktree_cleanup(args: argparse.Namespace) -> dict[str, Any]:
     return cleanup_worktree(proj, args.slug, base=args.base, discard=args.discard)
 
 
+def _read_text_file(path_arg: str, flag_name: str) -> str:
+    return read_utf8_file(path_arg, flag_name)
+
+
 def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     defaults = load_defaults()
     preset = args.preset
@@ -102,6 +109,16 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     mode = args.mode or ("write" if preset == "implement" else "read")
     executor_name = args.executor or defaults.get("routing", {}).get(preset, "codex")
     adapter = get_executor(executor_name)
+
+    task_text = _read_text_file(args.task_file, "--task-file") if args.task_file else (args.task or "")
+    if not task_text.strip():
+        raise KeelError("`--task` (or `--task-file`) is required.")
+    resolved_why = resolve_why(args.why, task_text)
+    if not resolved_why:
+        raise KeelError(
+            "Provide `--why` or include a non-empty `## Goal & Why` (or `## Why`) section in `--task` / `--task-file`."
+        )
+    extra_context = _read_text_file(args.context_file, "--context-file") if args.context_file else None
 
     caller_cwd = safe_resolve(Path.cwd())
     project_root = _resolve_project_root(args.project)
@@ -124,13 +141,9 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         workdir = caller_cwd
 
     write_target = prepare_branch_write(workdir, mode, norm_level, defaults)
-    task_text = args.task or ""
-    if args.task_file:
-        task_text = Path(args.task_file).read_text(encoding="utf-8")
 
     run_id = args.run_id or generate_run_id(preset)
     run_dir = runs_root_dir(project_root, Path(tempfile.gettempdir())) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     schema_path = safe_resolve(args.schema) if args.schema else (
         (SCHEMAS_DIR / "verdict.schema.json") if preset == "verify" and args.enforce_verdict_schema else None
@@ -141,7 +154,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
     brief_path = run_dir / "brief.md"
 
     brief_content = assemble_brief(
-        why=args.why,
+        why=resolved_why,
         task=task_text,
         preset=preset,
         mode=mode,
@@ -150,10 +163,12 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         native_agent_docs=adapter.native_agent_docs,
         loads_plugin_spine=adapter.loads_plugin_spine,
         caller_cwd=caller_cwd,
+        extra_context=extra_context,
         schema_path=schema_path,
         output_path=output_path,
         inject_schema_in_brief=adapter.inject_schema_in_brief,
     )
+    run_dir.mkdir(parents=True, exist_ok=True)
     brief_path.write_text(brief_content, encoding="utf-8")
 
     scratch_verify = is_disposable_verify_path(workdir)
@@ -171,6 +186,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         schema_path=schema_path,
         output_path=output_path,
         scratch_verify=scratch_verify,
+        why=resolved_why,
     )
     record = req.run_record(adapter.name)
     try:
@@ -179,7 +195,7 @@ def _cmd_agent_run(args: argparse.Namespace) -> dict[str, Any]:
         save_run_record(run_dir, {**record, **exc.partial})
         raise
     save_run_record(run_dir, record)
-    record_branch_write(write_target, adapter.name, record, defaults=defaults)
+    record_branch_write(write_target, adapter.name, record, defaults=defaults, why=resolved_why)
     return record
 
 
@@ -194,14 +210,14 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
         enforce_verify_min_level(effective_level, defaults)
 
     write_target = prepare_branch_write(Path(record["workdir"]), record["mode"], effective_level, defaults)
-    msg = args.message or ""
-    if args.message_file:
-        msg = Path(args.message_file).read_text(encoding="utf-8")
+    msg = _read_text_file(args.message_file, "--message-file") if args.message_file else (args.message or "")
+    if msg.startswith("\ufeff"):
+        msg = msg[1:]
     if not msg.strip():
         raise KeelError("Provide --message or --message-file for resume.")
 
     followup_path = run_dir / f"followup-{generate_run_id('msg')}.md"
-    followup_path.write_text(msg.strip() + "\n", encoding="utf-8")
+    followup_path.write_text(trim_markdown_block(msg) + "\n", encoding="utf-8")
     output_path = safe_resolve(args.output) if args.output else Path(record["output_path"])
 
     try:
@@ -216,7 +232,14 @@ def _cmd_agent_resume(args: argparse.Namespace) -> dict[str, Any]:
         record["level"] = level
     record.update(res)
     save_run_record(run_dir, record)
-    record_branch_write(write_target, adapter.name, record, defaults=defaults)
+    raw_why = record.get("why")
+    record_branch_write(
+        write_target,
+        adapter.name,
+        record,
+        defaults=defaults,
+        why=raw_why if isinstance(raw_why, str) else None,
+    )
     return record
 
 
@@ -342,9 +365,13 @@ def build_parser() -> argparse.ArgumentParser:
     ag_sub = ag.add_subparsers(dest="action", required=True, parser_class=_StrictArgumentParser)
 
     ag_r = ag_sub.add_parser("run", help="Assemble context brief and dispatch a side-agent run.")
-    ag_r.add_argument("--why", required=True, help="1-3 sentences bridging this task to the project's Core need.")
+    ag_r.add_argument(
+        "--why",
+        help="Optional when --task/--task-file has a non-empty '## Goal & Why' or '## Why' section; otherwise bridge this task to the project's Core need.",
+    )
     ag_r.add_argument("--task", help="Task goal, scope boundaries, and done criteria.")
     ag_r.add_argument("--task-file", help="Read task specification from file.")
+    ag_r.add_argument("--context-file", help="Optional supplementary context file (e.g., rework or pivot notes).")
     ag_r.add_argument("--preset", default="general", help="Context preset name (general, implement, verify).")
     ag_r.add_argument("--mode", choices=["read", "write"], help="Sandbox/workspace mode.")
     ag_r.add_argument("--executor", choices=sorted(EXECUTORS), help="Side-agent executor adapter.")

@@ -19,7 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from keel_lib import KeelError, SCHEMAS_DIR, load_defaults  # noqa: E402
-from keel_lib.context import assemble_brief, save_run_record  # noqa: E402
+from keel_lib.context import (  # noqa: E402
+    assemble_brief,
+    extract_changed_markdown_sections,
+    extract_markdown_section,
+    save_run_record,
+)
 from keel_lib.executors import EXECUTORS, ExecutorAdapter, RunRequest  # noqa: E402
 from keel_lib.executors import base
 from keel_lib.executors.agy import AgyExecutor  # noqa: E402
@@ -386,6 +391,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 project_root=repo, mode="read", preset="general", level="L2", model=None,
                 effort=None, schema_path=SCHEMAS_DIR / "verdict.schema.json",
                 output_path=path / "out.json", extra_git_dirs=(path / "extra",),
+                why="Persist why in running record.",
             )
             result = {"status": "SUCCESS", "conversation_id": "test-id", "response": "fallback",
                       "structured_output": {"title": "hello"}, "usage": {"tokens": 4}}
@@ -394,6 +400,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
                 self.assertEqual((running["status"], running["executor"], running["mode"]),
                                  ("running", "agy", req.mode))
                 self.assertEqual(running["scratch_verify"], req.scratch_verify)
+                self.assertEqual(running["why"], "Persist why in running record.")
                 self.assertEqual(cwd, repo)
                 self.assertEqual(env["KEEL_AGENT_MODE"], req.mode)
                 self.assertEqual(argv[0], "agy")
@@ -777,7 +784,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             finally:
                 EXECUTORS.pop("dummy-sdk", None)
 
-    def test_root_agents_md_has_five_project_sections_in_order(self) -> None:
+    def test_root_agents_md_has_six_project_sections_in_order(self) -> None:
         agents_text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
         lines = agents_text.splitlines()
         headings = [ln.strip() for ln in lines if ln.startswith("## ")]
@@ -785,6 +792,7 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             headings,
             [
                 "## Core need",
+                "## Design Philosophy",
                 "## Architecture & Boundaries",
                 "## Commands",
                 "## Gotchas",
@@ -793,6 +801,8 @@ class WorktreeAndDispatchTests(unittest.TestCase):
         )
 
         spine_text = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("## 1. Global core-need alignment", spine_text)
+        self.assertIn("## Design Philosophy", spine_text)
         sec4 = spine_text[spine_text.index("## 4. Orchestrator core loop") :]
         for required_clause in (
             "Default to Orchestrator; dispatch substantive writers (R1, R5, D1).",
@@ -808,23 +818,781 @@ class WorktreeAndDispatchTests(unittest.TestCase):
             "Verify each slice before advancing or landing (R3, P4).",
             "Stop after two rejected L4 rounds—at most 4 rounds from L2 (`L2 -> L3 -> L4 -> L4`), 3 from L3 (`L3 -> L4 -> L4`), or 2 from L4 (`L4 -> L4`)",
             "standing execution or landing delegation never authorizes `--force-round`, which requires explicit human authorization for that specific escalation",
+            "keel agent run --level <level> [--executor agy|codex] [--mode read|write] [--preset general|implement|verify] [--worktree <slug>] [--why <why>] (--task <text> | --task-file <file>) [--context-file <file>]",
             "keel branch verify <slug> [--base <ref>] [--task-file <file>] [--why <why>] [--context-file <file>] [--level <level>]",
             "keel branch status [<slug>] [--base <ref>]",
             "keel branch land <slug> [--base <ref>] [--squash | --ff-only]",
             "land slices in order using `--ff-only` on parent slices",
             "if a parent has no `docs/tasks/active/` file to archive (including one inherited from `main`)",
             "rebase the child `--onto main <parent-head-sha>`",
+            "### Review Rebuttals",
         ):
             with self.subTest(clause=required_clause):
                 self.assertIn(required_clause, sec4)
 
         req_text = (ROOT / "docs" / "requirements.md").read_text(encoding="utf-8")
+        self.assertIn("## Design Philosophy", req_text)
+        self.assertLess(
+            req_text.index("## Design Philosophy"),
+            req_text.index("## Layer 1: Pure Requirements"),
+        )
         self.assertIn("Reserve direct main-session edits for trivial, few-line changes", req_text)
         self.assertIn("dispatch substantive single-slice work to a clean-context writer", req_text)
         self.assertIn("without mandatory ticket templates, hosted pull requests, or custom CI job names", req_text)
 
         skill_text = (ROOT / "skills" / "keel-repo-ops" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("Reserve direct main-session edits for trivial, few-line changes, and dispatch substantive slices to a clean-context writer (`D1`).", skill_text)
+        for required_skill_clause in (
+            "six-section",
+            "six sections in order",
+            "## Core need",
+            "## Design Philosophy",
+            "## Architecture & Boundaries",
+            "## Commands",
+            "## Gotchas",
+            "## Where to look",
+            "Bad vs Good `## Core need`",
+            "Bad vs Good Task Spec",
+            "### Review Rebuttals",
+            "Reserve direct main-session edits for trivial, few-line changes, and dispatch substantive slices to a clean-context writer (`D1`).",
+        ):
+            with self.subTest(skill_clause=required_skill_clause):
+                self.assertIn(required_skill_clause, skill_text)
+
+    def test_single_doc_task_handoff_markdown_extraction_and_context_file(self) -> None:
+        # 1. Markdown section extraction handles Goal & Why / Why, nested subheadings, and fenced code blocks
+        #    (including fences opened inside list items and blockquotes)
+        doc_with_fences = (
+            "# Task: Parser Fix\n\n"
+            "Intro with example fences:\n"
+            "```markdown\n"
+            "## Goal & Why\n"
+            "FAKE FENCED BACKTICK GOAL\n"
+            "```\n\n"
+            "~~~markdown\n"
+            "## Why\n"
+            "FAKE FENCED TILDE GOAL\n"
+            "~~~\n\n"
+            "- ```md\n"
+            "  ## Why\n"
+            "  FAKE LIST-FENCED GOAL\n"
+            "  ```\n"
+            "* ~~~md\n"
+            "  ## Goal & Why\n"
+            "  FAKE ASTERISK-FENCED GOAL\n"
+            "  ~~~\n"
+            "1. ```markdown\n"
+            "   ## Why\n"
+            "   FAKE NUMBERED-LIST FENCED GOAL\n"
+            "   ```\n"
+            "> ```md\n"
+            "> ## Goal & Why\n"
+            "> FAKE BLOCKQUOTE FENCED GOAL\n"
+            "> ```\n\n"
+            "## Goal & Why\n\n"
+            "Keep user CSV dates lossless.\n\n"
+            "### Edge Cases\n"
+            "Reject ambiguous DMY/MDY formats.\n\n"
+            "## Bounds\n"
+            "parser.py only.\n"
+        )
+        extracted = extract_markdown_section(doc_with_fences, ("Goal & Why", "Why"))
+        self.assertEqual(
+            extracted,
+            "Keep user CSV dates lossless.\n\n### Edge Cases\nReject ambiguous DMY/MDY formats.",
+        )
+
+        # Default `levels=(2,)` rejects `###` headings; explicit `levels=(2, 3)` extracts level-3 sections
+        doc_h3 = (
+            "## Decisions & Findings\n\n"
+            "### Review Rebuttals\n"
+            "Evidence-backed pushback.\n\n"
+            "### Other Note\n"
+            "Should not be included.\n"
+        )
+        self.assertIsNone(extract_markdown_section(doc_h3, ("Review Rebuttals",)))
+        self.assertEqual(
+            extract_markdown_section(doc_h3, ("Review Rebuttals",), levels=(2, 3)),
+            "Evidence-backed pushback.",
+        )
+
+        # Empty, fenced-only, blockquote-inside-top-level-fence, or nested `### Why` under `## Bounds` returns None
+        self.assertIsNone(
+            extract_markdown_section(
+                "```md\n## Goal & Why\nInside fence\n```\n\n## Bounds\nOnly x.py\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "```md\n> ```\n## Why\nStill inside top-level fence!\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "> ```md\n> > ```\n> ## Why\n> Still inside depth-1 blockquote fence!\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "> ```md\n> ## Why\n> Quoted unclosed fence\n\n## Goal & Why\nOutside ended blockquote.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Outside ended blockquote.",
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "- Reference template:\n\n    ```markdown\n  ## Why\n  Example only.\n    ```\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        # CommonMark §5.1 lazy paragraph continuation inside list items and blockquotes
+        lazy_list_fence = (
+            "- The previous ticket used this example\n"
+            "as its reference template:\n\n"
+            "    ```markdown\n"
+            "  ## Why\n"
+            "  Old ticket objective.\n"
+            "    ```\n"
+        )
+        self.assertIsNone(extract_markdown_section(lazy_list_fence, ("Goal & Why", "Why")))
+        self.assertEqual(
+            extract_markdown_section(
+                lazy_list_fence + "\n## Goal & Why\nReal objective.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real objective.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "> Previous note wrapped\n"
+                "onto unindented lazy continuation:\n"
+                "> ```markdown\n"
+                "> ## Why\n"
+                "> Fake quoted why.\n"
+                "> ```\n\n"
+                "## Goal & Why\nReal after lazy quote.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real after lazy quote.",
+        )
+        # CommonMark §4.4 indented code blocks (top-level, multi-paragraph with blank lines, and after Setext headings)
+        self.assertIsNone(
+            extract_markdown_section(
+                "    ```markdown\n    ## Why\n    Fake.\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "    ```markdown\n    ## Why\n    Fake.\n\n## Goal & Why\nReal after indented code.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real after indented code.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "    ```markdown\n\n    ## Why\n    Still indented code.\n\n## Goal & Why\nReal after blank in code.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real after blank in code.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "Intro Heading\n---\n    ```markdown\n    ## Why\n    Indented code after setext.\n\n## Goal & Why\nReal after setext.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real after setext.",
+        )
+        # CommonMark §4.6 HTML comment blocks (multi-line, single-line, paragraph-interrupting) and HTML blocks
+        self.assertIsNone(
+            extract_markdown_section(
+                "<!--\n## Why\nCommented template.\n-->\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "<!-- ## Why -->\nCommented single-line heading.\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "<!--\n## Why\nCommented placeholder.\n-->\n\n## Goal & Why\nActual user goal.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Actual user goal.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "- Wrapped list note\n<!--\n## Why\nInterrupted by comment.\n-->\n\n## Goal & Why\nGoal after comment.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Goal after comment.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "<details>\n<summary>Reference</summary>\n## Why\nCollapsed example.\n</details>\n\n## Goal & Why\nGoal after details.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Goal after details.",
+        )
+        # Round 6: UTF-8 BOM (`\ufeff`) before fence / heading + preserved first-line horizontal indentation
+        self.assertIsNone(
+            extract_markdown_section(
+                "\ufeff~~~md\n## Why\nFake inside BOM tilde fence.\n~~~\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "\ufeff~~~md\n## Why\nFake inside BOM tilde fence.\n~~~\n\n## Goal & Why\nReal after BOM fence.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real after BOM fence.",
+        )
+        self.assertEqual(
+            extract_markdown_section("\ufeff## Why\nDirect BOM goal.\n", ("Goal & Why", "Why")),
+            "Direct BOM goal.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "## Goal & Why\n  \n    ## Done-check\n    Indented example.\n\nKeep bounds intact.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "    ## Done-check\n    Indented example.\n\nKeep bounds intact.",
+        )
+        changed_indented = extract_changed_markdown_sections(
+            "# Task\n\n## Decisions & Findings\nInitial.\n",
+            "# Task\n\n## Decisions & Findings\n  \n    ## Done-check\n    Example code block\n",
+            ("Progress", "Decisions & Findings", "Review Rebuttals"),
+            levels=(2, 3),
+        )
+        self.assertEqual(
+            changed_indented,
+            "## Decisions & Findings\n\n    ## Done-check\n    Example code block",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "1. Example:\n\n     ```markdown\n   ## Fake Why\n     ```\n\n"
+                "## Goal & Why\nReal numbered-list follow-up goal.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real numbered-list follow-up goal.",
+        )
+        self.assertEqual(
+            extract_markdown_section(
+                "1. ```markdown\n   ## Fake\n   ```\n\n## Why\nReal goal.\n",
+                ("Goal & Why", "Why"),
+            ),
+            "Real goal.",
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "> ## Why\n> Quoted example\n\n- ## Why\n  List example\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertIsNone(
+            extract_markdown_section(
+                "## Bounds\nOnly x.py\n\n### Why\nNested level-3 why under Bounds\n",
+                ("Goal & Why", "Why"),
+            )
+        )
+        self.assertIsNone(
+            extract_markdown_section("## Goal & Why\n   \n## Bounds\nOnly x.py\n", ("Goal & Why", "Why"))
+        )
+
+        # Changed sections deduplicate nested `### Review Rebuttals` inside `## Decisions & Findings`
+        base_md = "## Progress\n- [ ] Step 1\n\n## Decisions & Findings\nInitial note.\n"
+        head_md = (
+            "## Progress\n- [x] Step 1\n\n"
+            "## Decisions & Findings\nInitial note.\n\n"
+            "### Review Rebuttals\nFinding 1 is out of scope.\n"
+        )
+        changed = extract_changed_markdown_sections(
+            base_md, head_md, ("Progress", "Decisions & Findings", "Review Rebuttals"), levels=(2, 3)
+        )
+        assert changed is not None
+        self.assertIn("## Progress\n\n- [x] Step 1", changed)
+        self.assertIn("## Decisions & Findings", changed)
+        self.assertEqual(changed.count("### Review Rebuttals"), 1)
+
+        # 2. assemble_brief supports why=None (extracted from task) and extra_context
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            _init_repo(repo)
+            (repo / "AGENTS.md").write_text("## Core need\nExact parsing.\n", encoding="utf-8")
+
+            brief = assemble_brief(
+                why=None,
+                task="# Task\n\n## Why\nPrevent silent date swaps.\n\n## Bounds\napp.py\n",
+                preset="implement",
+                mode="write",
+                workdir=repo,
+                project_root=repo,
+                extra_context="Pivot note: keep CLI flag backwards compatible.",
+            )
+            self.assertIn("## Why (Global Alignment)\n\nPrevent silent date swaps.", brief)
+            self.assertIn("## Additional Context\n\nPivot note: keep CLI flag backwards compatible.", brief)
+            self.assertLess(
+                brief.index("## Task, Scope & Done Criteria"),
+                brief.index("## Additional Context"),
+            )
+            self.assertLess(brief.index("## Additional Context"), brief.index("## Lens: Implementation"))
+
+            with self.assertRaises(KeelError) as err_ctx:
+                assemble_brief(
+                    why=None,
+                    task="# Task\n\n## Bounds\napp.py\n",
+                    preset="general",
+                    mode="read",
+                    workdir=repo,
+                    project_root=repo,
+                )
+            self.assertNotIn("1-3 sentences", str(err_ctx.exception))
+
+            # 3. Real-Git CLI `keel agent run` without `--why`, with `--context-file`, and clean failure modes
+            agy = repo / "agy"
+            agy.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json\n"
+                "print(json.dumps({'conversation_id': 'handoff-sess', 'status': 'SUCCESS', 'response': 'ok'}))\n",
+                encoding="utf-8",
+            )
+            agy.chmod(0o755)
+
+            clean_sub_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("KEEL_AGENT_MODE", "DEVSTANDARD_AGENT_MODE", "DEVSTANDARD_ROLE")
+            }
+            clean_sub_env["PATH"] = str(repo) + os.pathsep + os.environ["PATH"]
+
+            def run_agent(*cli_args: str, expected_rc: int = 0) -> tuple[int, str, str]:
+                proc = subprocess.run(
+                    [str(ROOT / "scripts" / "keel"), "agent", "run", *cli_args, "--project", str(repo)],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=clean_sub_env,
+                )
+                self.assertEqual(proc.returncode, expected_rc, proc.stderr)
+                return proc.returncode, proc.stdout, proc.stderr
+
+            # (a) Missing both `--why` and `## Goal & Why` fails cleanly with exit 2 and ZERO orphan run dir / worktree!
+            no_why_spec = repo / "no-why.md"
+            no_why_spec.write_text(
+                "# Task\n\n```markdown\n## Goal & Why\nFenced only!\n```\n\n## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, _, err_no_why = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created",
+                "--task-file", str(no_why_spec), "--run-id", "orphan-check-1",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_no_why)
+            self.assertFalse((repo / ".agents/runs/orphan-check-1").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created").exists())
+
+            # (b) Empty `## Goal & Why` also fails cleanly with exit 2 and ZERO orphan run dir!
+            empty_why_spec = repo / "empty-why.md"
+            empty_why_spec.write_text("# Task\n\n## Goal & Why\n\n## Bounds\napp.py\n", encoding="utf-8")
+            run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(empty_why_spec), "--run-id", "orphan-check-2",
+                expected_rc=2,
+            )
+            self.assertFalse((repo / ".agents/runs/orphan-check-2").exists())
+
+            # (b2) Task containing only `## Bounds` + nested `### Why` fails cleanly with exit 2 and ZERO orphan run dir!
+            h3_why_spec = repo / "h3-why.md"
+            h3_why_spec.write_text(
+                "# Task\n\n## Bounds\napp.py\n\n### Why\nNested subsection under Bounds must not qualify.\n",
+                encoding="utf-8",
+            )
+            _, _, err_h3_why = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created-h3",
+                "--task-file", str(h3_why_spec), "--run-id", "orphan-check-h3",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_h3_why)
+            self.assertFalse((repo / ".agents/runs/orphan-check-h3").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created-h3").exists())
+
+            # (b3) Top-level ` ```md ` containing `> ``` ` does NOT close the fence prematurely; exits 2 with zero run dir!
+            bq_in_fence_spec = repo / "bq-in-fence.md"
+            bq_in_fence_spec.write_text(
+                "# Task\n\n```md\n> ```\n## Why\nStill inside unclosed top-level fence!\n",
+                encoding="utf-8",
+            )
+            _, _, err_bq_fence = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created-bq",
+                "--task-file", str(bq_in_fence_spec), "--run-id", "orphan-check-bq-in-fence",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_bq_fence)
+            self.assertFalse((repo / ".agents/runs/orphan-check-bq-in-fence").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created-bq").exists())
+
+            # (c) Missing, untraversable (`chmod 000`), or non-UTF-8 `--context-file` / `--task-file` fails cleanly with exit 2!
+            if os.geteuid() != 0:
+                locked_dir = repo / "locked-ctx-dir"
+                locked_dir.mkdir()
+                locked_ctx = locked_dir / "ctx.md"
+                locked_ctx.write_text("hidden\n", encoding="utf-8")
+                locked_dir.chmod(0o000)
+                try:
+                    _, _, err_perm = run_agent(
+                        "--level", "L2", "--executor", "agy",
+                        "--why", "Check permission error handling.",
+                        "--task", "Inspect.",
+                        "--context-file", str(locked_ctx),
+                        "--run-id", "orphan-check-perm",
+                        expected_rc=2,
+                    )
+                    self.assertIn("keel error:", err_perm)
+                    self.assertIn("--context-file", err_perm)
+                    self.assertNotIn("Traceback", err_perm)
+                    self.assertFalse((repo / ".agents/runs/orphan-check-perm").exists())
+                finally:
+                    locked_dir.chmod(0o755)
+                    locked_ctx.unlink()
+                    locked_dir.rmdir()
+            good_spec = repo / "good-spec.md"
+            good_spec.write_text(
+                "# Task: Good\n\n"
+                "- ```md\n"
+                "  ## Why\n"
+                "  Ignored inside bullet code fence\n"
+                "  ```\n\n"
+                "## Goal & Why\nKeep single-document handoff authoritative.\n\n"
+                "## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, _, err_ctx_missing = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(good_spec),
+                "--context-file", str(repo / "missing-context.md"),
+                "--run-id", "orphan-check-3",
+                expected_rc=2,
+            )
+            self.assertIn("--context-file", err_ctx_missing)
+            self.assertFalse((repo / ".agents/runs/orphan-check-3").exists())
+
+            utf16_ctx = repo / "utf16-context.md"
+            utf16_ctx.write_bytes("UTF-16 context note".encode("utf-16"))
+            _, _, err_ctx_utf16 = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(good_spec),
+                "--context-file", str(utf16_ctx),
+                "--run-id", "orphan-check-utf16",
+                expected_rc=2,
+            )
+            self.assertIn("keel error:", err_ctx_utf16)
+            self.assertIn("UTF-8", err_ctx_utf16)
+            self.assertNotIn("Traceback", err_ctx_utf16)
+            self.assertFalse((repo / ".agents/runs/orphan-check-utf16").exists())
+
+            _, _, err_task_utf16 = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(utf16_ctx),
+                "--run-id", "orphan-check-task-utf16",
+                expected_rc=2,
+            )
+            self.assertIn("keel error:", err_task_utf16)
+            self.assertIn("UTF-8", err_task_utf16)
+            self.assertNotIn("Traceback", err_task_utf16)
+            self.assertFalse((repo / ".agents/runs/orphan-check-task-utf16").exists())
+
+            # (d) `--task-file` without `--why` + valid `--context-file` succeeds cleanly (without leaking bullet fence or Bounds)!
+            ctx_file = repo / "rework-notes.md"
+            ctx_file.write_text("Address round-1 finding on empty inputs.\n", encoding="utf-8")
+            _, out_ok, _ = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "handoff-wt",
+                "--task-file", str(good_spec),
+                "--context-file", str(ctx_file),
+                "--run-id", "handoff-ok-1",
+                expected_rc=0,
+            )
+            payload_ok = json.loads(out_ok)
+            self.assertEqual(payload_ok["why"], "Keep single-document handoff authoritative.")
+            brief_ok = Path(payload_ok["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nKeep single-document handoff authoritative.", brief_ok)
+            self.assertNotIn("Ignored inside bullet code fence", brief_ok.split("## Task, Scope & Done Criteria")[0])
+            self.assertNotIn("## Bounds", brief_ok.split("## Task, Scope & Done Criteria")[0])
+            self.assertIn("## Additional Context\n\nAddress round-1 finding on empty inputs.", brief_ok)
+
+            # UTF-16 `--message-file` on `agent resume` also fails cleanly with exit 2 and no orphan followup file
+            utf16_msg = repo / "utf16-msg.md"
+            utf16_msg.write_bytes("UTF-16 resume message".encode("utf-16"))
+            res_utf16 = subprocess.run(
+                [
+                    str(ROOT / "scripts" / "keel"), "agent", "resume", "handoff-ok-1",
+                    "--message-file", str(utf16_msg), "--project", str(repo),
+                ],
+                cwd=repo, capture_output=True, text=True, timeout=10,
+                env=clean_sub_env,
+            )
+            self.assertEqual(res_utf16.returncode, 2)
+            self.assertIn("keel error:", res_utf16.stderr)
+            self.assertIn("UTF-8", res_utf16.stderr)
+            self.assertNotIn("Traceback", res_utf16.stderr)
+            self.assertEqual(list((repo / ".agents/runs/handoff-ok-1").glob("followup-*.md")), [])
+
+            # (b4) Multi-line list continuation fence (`- Reference template:\n\n    ```markdown\n  ## Why...`) exits 2!
+            list_cont_fence_spec = repo / "list-cont-fence.md"
+            list_cont_fence_spec.write_text(
+                "- Reference template:\n\n    ```markdown\n  ## Why\n  Example only.\n    ```\n",
+                encoding="utf-8",
+            )
+            _, _, err_list_cont = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created-list-cont",
+                "--task-file", str(list_cont_fence_spec), "--run-id", "orphan-check-list-cont",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_list_cont)
+            self.assertFalse((repo / ".agents/runs/orphan-check-list-cont").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created-list-cont").exists())
+
+            # (b5) Blockquoted (`> ## Why`) or list-nested (`- ## Why`) headings without top-level `## Why` exit 2!
+            nested_heading_spec = repo / "nested-headings-only.md"
+            nested_heading_spec.write_text(
+                "# Task\n\n> ## Why\n> Quoted example\n\n- ## Why\n  List example\n\n## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(nested_heading_spec), "--run-id", "orphan-check-nested-headings",
+                expected_rc=2,
+            )
+            self.assertFalse((repo / ".agents/runs/orphan-check-nested-headings").exists())
+
+            # (e) `## Why` heading variant + numbered-list continuation & inline fences work without `--why`
+            why_only_spec = repo / "why-only.md"
+            why_only_spec.write_text(
+                "# Task\n\n"
+                "1. Example:\n\n"
+                "     ```markdown\n"
+                "   ## Fake Why\n"
+                "     ```\n\n"
+                "## Goal & Why\n"
+                "Real numbered-list follow-up goal.\n\n"
+                "## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_why, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(why_only_spec),
+                "--run-id", "handoff-ok-2",
+                expected_rc=0,
+            )
+            brief_why = Path(json.loads(out_why)["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nReal numbered-list follow-up goal.", brief_why)
+
+            inline_num_spec = repo / "inline-num.md"
+            inline_num_spec.write_text(
+                "1. ```markdown\n   ## Fake\n   ```\n\n## Why\nReal goal.\n\n## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_inline_num, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(inline_num_spec),
+                "--run-id", "handoff-ok-3",
+                expected_rc=0,
+            )
+            brief_inline_num = Path(json.loads(out_inline_num)["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nReal goal.", brief_inline_num)
+
+            # (f) Round 4 CommonMark lazy paragraph continuation & 4-space indented code block CLI checks
+            lazy_only_spec = repo / "lazy-list-cont-only.md"
+            lazy_only_spec.write_text(
+                "- The previous ticket used this example\n"
+                "as its reference template:\n\n"
+                "    ```markdown\n"
+                "  ## Why\n"
+                "  Old ticket objective.\n"
+                "    ```\n",
+                encoding="utf-8",
+            )
+            _, _, err_lazy_only = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created-lazy-cont",
+                "--task-file", str(lazy_only_spec), "--run-id", "orphan-check-lazy-cont",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_lazy_only)
+            self.assertFalse((repo / ".agents/runs/orphan-check-lazy-cont").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created-lazy-cont").exists())
+
+            lazy_then_real_spec = repo / "lazy-list-then-real.md"
+            lazy_then_real_spec.write_text(
+                "- The previous ticket used this example\n"
+                "as its reference template:\n\n"
+                "    ```markdown\n"
+                "  ## Why\n"
+                "  Old ticket objective.\n"
+                "    ```\n\n"
+                "## Goal & Why\n"
+                "Real objective.\n\n"
+                "## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_lazy_real, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(lazy_then_real_spec),
+                "--run-id", "handoff-ok-lazy-cont",
+                expected_rc=0,
+            )
+            payload_lazy_real = json.loads(out_lazy_real)
+            self.assertEqual(payload_lazy_real["why"], "Real objective.")
+            brief_lazy_real = Path(payload_lazy_real["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nReal objective.", brief_lazy_real)
+            self.assertNotIn("Old ticket objective.", brief_lazy_real.split("## Task, Scope & Done Criteria")[0])
+
+            indented_code_only_spec = repo / "indented-code-only.md"
+            indented_code_only_spec.write_text(
+                "    ```markdown\n    ## Why\n    Fake.\n",
+                encoding="utf-8",
+            )
+            run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(indented_code_only_spec),
+                "--run-id", "orphan-check-indented-code",
+                expected_rc=2,
+            )
+            self.assertFalse((repo / ".agents/runs/orphan-check-indented-code").exists())
+
+            indented_code_then_real_spec = repo / "indented-code-then-real.md"
+            indented_code_then_real_spec.write_text(
+                "    ```markdown\n"
+                "    ## Why\n"
+                "    Fake.\n\n"
+                "## Goal & Why\n"
+                "Real after indented code.\n\n"
+                "## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_indented_real, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(indented_code_then_real_spec),
+                "--run-id", "handoff-ok-indented-code",
+                expected_rc=0,
+            )
+            payload_indented_real = json.loads(out_indented_real)
+            self.assertEqual(payload_indented_real["why"], "Real after indented code.")
+            brief_indented_real = Path(payload_indented_real["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nReal after indented code.", brief_indented_real)
+            self.assertNotIn("Fake.", brief_indented_real.split("## Task, Scope & Done Criteria")[0])
+
+            # (g) Round 5: leading line-1 4-space indented `    ## Why` + CommonMark §4.6 HTML comment blocks
+            leading_indented_spec = repo / "leading-indented-h2.md"
+            leading_indented_spec.write_text(
+                "    ## Why\n    Example only.\n\n## Goal & Why\nPrevent data loss.\n\n## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_leading_ind, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(leading_indented_spec),
+                "--run-id", "handoff-ok-leading-indented",
+                expected_rc=0,
+            )
+            payload_leading_ind = json.loads(out_leading_ind)
+            self.assertEqual(payload_leading_ind["why"], "Prevent data loss.")
+            brief_leading_ind = Path(payload_leading_ind["brief_path"]).read_text(encoding="utf-8")
+            self.assertIn("## Why (Global Alignment)\n\nPrevent data loss.", brief_leading_ind)
+            self.assertIn("## Task, Scope & Done Criteria\n\n    ## Why\n", brief_leading_ind)
+
+            html_comment_only_spec = repo / "html-comment-only.md"
+            html_comment_only_spec.write_text(
+                "<!--\n## Why\nCommented template.\n-->\n\n<!-- ## Why -->\nBody.\n",
+                encoding="utf-8",
+            )
+            _, _, err_html_only = run_agent(
+                "--level", "L2", "--executor", "agy", "--worktree", "never-created-html-comment",
+                "--task-file", str(html_comment_only_spec), "--run-id", "orphan-check-html-comment",
+                expected_rc=2,
+            )
+            self.assertIn("Goal & Why", err_html_only)
+            self.assertFalse((repo / ".agents/runs/orphan-check-html-comment").exists())
+            self.assertFalse((repo / ".agents/worktrees/never-created-html-comment").exists())
+
+            single_line_comment_spec = repo / "single-line-comment-only.md"
+            single_line_comment_spec.write_text(
+                "<!-- ## Why -->\nNot a real heading.\n",
+                encoding="utf-8",
+            )
+            run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(single_line_comment_spec), "--run-id", "orphan-check-single-comment",
+                expected_rc=2,
+            )
+            self.assertFalse((repo / ".agents/runs/orphan-check-single-comment").exists())
+
+            html_comment_then_real_spec = repo / "html-comment-then-real.md"
+            html_comment_then_real_spec.write_text(
+                "<!--\n## Why\nCommented placeholder.\n-->\n\n## Goal & Why\nActual user goal.\n\n## Bounds\napp.py\n",
+                encoding="utf-8",
+            )
+            _, out_html_real, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(html_comment_then_real_spec),
+                "--run-id", "handoff-ok-html-comment",
+                expected_rc=0,
+            )
+            payload_html_real = json.loads(out_html_real)
+            self.assertEqual(payload_html_real["why"], "Actual user goal.")
+            brief_html_real = Path(payload_html_real["brief_path"]).read_text(encoding="utf-8")
+            why_alignment_part = brief_html_real.split("## Task, Scope & Done Criteria")[0]
+            self.assertIn("## Why (Global Alignment)\n\nActual user goal.", why_alignment_part)
+            self.assertNotIn("Commented placeholder", why_alignment_part)
+            self.assertNotIn("-->", why_alignment_part)
+
+            # (h) Round 6: UTF-8 BOM (`\ufeff`) before `~~~md` fence and directly before `## Why` on `agent run`
+            bom_fence_only_spec = repo / "bom-fence-only.md"
+            bom_fence_only_spec.write_bytes(
+                "\ufeff~~~md\n## Why\nFake BOM fenced why.\n~~~\n".encode("utf-8")
+            )
+            run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(bom_fence_only_spec), "--run-id", "orphan-check-bom-fence",
+                expected_rc=2,
+            )
+            self.assertFalse((repo / ".agents/runs/orphan-check-bom-fence").exists())
+
+            bom_fence_real_spec = repo / "bom-fence-then-real.md"
+            bom_fence_real_spec.write_bytes(
+                "\ufeff~~~md\n## Why\nFake BOM fenced why.\n~~~\n\n## Goal & Why\nReal goal after BOM fence.\n".encode("utf-8")
+            )
+            _, out_bom_fence, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(bom_fence_real_spec), "--run-id", "handoff-ok-bom-fence",
+                expected_rc=0,
+            )
+            payload_bom_fence = json.loads(out_bom_fence)
+            self.assertEqual(payload_bom_fence["why"], "Real goal after BOM fence.")
+            brief_bom_fence = Path(payload_bom_fence["brief_path"]).read_text(encoding="utf-8")
+            self.assertNotIn("\ufeff", brief_bom_fence)
+            self.assertIn("## Why (Global Alignment)\n\nReal goal after BOM fence.", brief_bom_fence)
+
+            bom_direct_why_spec = repo / "bom-direct-why.md"
+            bom_direct_why_spec.write_bytes("\ufeff## Why\nDirect BOM why.\n\n## Bounds\napp.py\n".encode("utf-8"))
+            _, out_bom_why, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task-file", str(bom_direct_why_spec), "--run-id", "handoff-ok-bom-why",
+                expected_rc=0,
+            )
+            self.assertEqual(json.loads(out_bom_why)["why"], "Direct BOM why.")
+
+            _, out_bom_inline_task, _ = run_agent(
+                "--level", "L2", "--executor", "agy",
+                "--task", "\ufeff## Why\nInline BOM why.\n", "--run-id", "handoff-ok-bom-inline",
+                expected_rc=0,
+            )
+            self.assertEqual(json.loads(out_bom_inline_task)["why"], "Inline BOM why.")
 
     def test_install_plugin_per_entry_symlinks_exclude_root_agents_md(self) -> None:
         installer = ROOT / "scripts" / "install-plugin"

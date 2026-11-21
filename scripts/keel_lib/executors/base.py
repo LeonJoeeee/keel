@@ -112,10 +112,11 @@ class RunRequest:
     extra_git_dirs: tuple[Path, ...] = ()
     scratch_verify: bool = False
     level: str | None = None
+    why: str | None = None
 
     def run_record(self, executor: str) -> dict[str, Any]:
         """Metadata shared by the turn-one hook, persisted run and warm resume."""
-        return {
+        rec: dict[str, Any] = {
             "run_id": self.run_id,
             "executor": executor,
             "preset": self.preset,
@@ -129,6 +130,9 @@ class RunRequest:
             "extra_git_dirs": [str(path) for path in self.extra_git_dirs],
             "scratch_verify": self.scratch_verify,
         }
+        if self.why is not None:
+            rec["why"] = self.why
+        return rec
 
 
 class ExecutorAdapter(ABC):

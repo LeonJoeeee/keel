@@ -10,11 +10,22 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tempfile
 from typing import Any, Iterator, Sequence
 
 from . import KeelError, SCHEMAS_DIR
-from .context import assemble_brief, generate_run_id, runs_root_dir, save_run_record
+from .context import (
+    WHY_HEADINGS,
+    assemble_brief,
+    extract_changed_markdown_sections,
+    extract_markdown_section,
+    generate_run_id,
+    read_utf8_file,
+    runs_root_dir,
+    save_run_record,
+    trim_markdown_block,
+)
 from .env import check_interrupted, forward_signals_to_child_groups, run_cmd, safe_resolve, same_path, tool_env
 from .executors import RunRequest, get_executor
 from .executors.base import (
@@ -299,7 +310,23 @@ def _read_blob_sha(project: Path, rev: str, rel_path: str) -> str | None:
 def _read_blob_text(project: Path, rev: str, rel_path: str) -> str | None:
     if _read_blob_sha(project, rev, rel_path) is None:
         return None
-    return run_cmd(["git", "show", f"{rev}:{rel_path}"], cwd=project).stdout.strip()
+    proc = subprocess.run(
+        ["git", "show", f"{rev}:{rel_path}"],
+        cwd=str(project),
+        env=tool_env(),
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise KeelError(f"Unable to read '{rel_path}' at '{rev}': {detail}")
+    try:
+        decoded = proc.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise KeelError(f"Task file '{rel_path}' at '{rev}' is not valid UTF-8: {exc}") from exc
+    if decoded.startswith("\ufeff"):
+        decoded = decoded[1:]
+    return trim_markdown_block(decoded)
 
 
 def _effective_task_blob_sha(project: Path, base_tip_sha: str, head_sha: str, task_file: str | None) -> str | None:
@@ -329,9 +356,9 @@ def normalize_task_rel_path(project: Path, raw_task_file: str) -> str:
 def _task_exists_in_git(project: Path, base_ref: str, head_sha: str | None, rel: str) -> bool:
     todo_equiv = ("docs/tasks/todo/" + Path(rel).name) if rel.startswith("docs/tasks/active/") else None
     return (
-        _read_blob_text(project, base_ref, rel) is not None
-        or (head_sha is not None and _read_blob_text(project, head_sha, rel) is not None)
-        or (todo_equiv is not None and _read_blob_text(project, base_ref, todo_equiv) is not None)
+        _read_blob_sha(project, base_ref, rel) is not None
+        or (head_sha is not None and _read_blob_sha(project, head_sha, rel) is not None)
+        or (todo_equiv is not None and _read_blob_sha(project, base_ref, todo_equiv) is not None)
     )
 
 
@@ -1015,6 +1042,7 @@ def record_branch_write(
     result: dict[str, Any],
     *,
     defaults: dict[str, Any] | None = None,
+    why: str | None = None,
 ) -> None:
     if target is None or result.get("status") != "completed":
         return
@@ -1041,14 +1069,24 @@ def record_branch_write(
     level = result["level"]
     levels = defaults.get("levels") if defaults else None
     verify_min_level = defaults.get("verify_min_level") if defaults else None
+    raw_why = (why[1:] if why.startswith("\ufeff") else why) if isinstance(why, str) else None
+    clean_why = (trim_markdown_block(raw_why) or None) if raw_why is not None else None
     with edit_gate_state(common_dir, branch) as state:
         rounds = state["rounds"]
+        prev_write = state.get("last_write") or {}
+        if clean_why is None:
+            prev_why = prev_write.get("why")
+            if isinstance(prev_why, str):
+                raw_prev = prev_why[1:] if prev_why.startswith("\ufeff") else prev_why
+                clean_why = trim_markdown_block(raw_prev) or None
         write: dict[str, Any] = {
             "executor": executor,
             "level": level,
             "after_round": len(rounds),
             "recorded_at": _now_iso(),
         }
+        if clean_why:
+            write["why"] = clean_why
         if head_sha:
             write["head_sha"] = head_sha
         if head_tree_sha:
@@ -1085,6 +1123,7 @@ def _verify_one(
             run_id=run_id, run_dir=run_dir, brief_path=run_dir / "brief.md", project_root=project,
             workdir=checkout, mode="read", preset="verify", level=level, model=model, effort=effort,
             schema_path=schema, output_path=verdict_file, extra_git_dirs=(git_dir,), scratch_verify=True,
+            why=why,
         )
         req.brief_path.write_text(assemble_brief(
             why=why, task=task, preset=req.preset, mode=req.mode, workdir=checkout, project_root=project,
@@ -1142,6 +1181,8 @@ def verify_branch(
 
     if dual and any(value is not None for value in (executor, model, effort)):
         raise KeelConfigError("--dual selects both executors. Use --level to select their tier.")
+
+    extra_ctx = trim_markdown_block(read_utf8_file(context_file, "--context-file")) if context_file else ""
 
     project = primary_checkout_root(project)
     ensure_agents_dir_ignored(project)
@@ -1262,9 +1303,20 @@ def verify_branch(
     task_blob_sha = _effective_task_blob_sha(project, base_tip_sha, head_sha, task_file)
 
     commit_log = run_cmd(["git", "log", "--oneline", f"{merge_base_sha}..{head_sha}"], cwd=project).stdout.strip()
-    extra_ctx = Path(context_file).read_text(encoding="utf-8").strip() if context_file else ""
-    why_text = why or (
-        f"Independently verify branch '{branch}' against the repository's Core need and locked task bounds before landing onto '{base_ref}'."
+    spec_why = extract_markdown_section(locked_spec or branch_spec or "", WHY_HEADINGS, levels=(2,))
+    raw_recorded_why = last_write.get("why")
+    if isinstance(raw_recorded_why, str) and raw_recorded_why.startswith("\ufeff"):
+        raw_recorded_why = raw_recorded_why[1:]
+    recorded_why = (trim_markdown_block(raw_recorded_why) or None) if isinstance(raw_recorded_why, str) else None
+    raw_explicit_why = (why[1:] if why.startswith("\ufeff") else why) if isinstance(why, str) else None
+    explicit_why = (trim_markdown_block(raw_explicit_why) or None) if raw_explicit_why is not None else None
+    why_text = (
+        explicit_why
+        or spec_why
+        or recorded_why
+        or (
+            f"Independently verify branch '{branch}' against the repository's Core need and locked task bounds before landing onto '{base_ref}'."
+        )
     )
 
     task_lines = [
@@ -1285,6 +1337,21 @@ def verify_branch(
                 locked_spec,
             ]
         )
+        if branch_spec and branch_spec != locked_spec:
+            advisory = extract_changed_markdown_sections(
+                locked_spec,
+                branch_spec,
+                ("Progress", "Decisions & Findings", "Review Rebuttals"),
+                levels=(2, 3),
+            )
+            if advisory:
+                task_lines.extend(
+                    [
+                        "",
+                        "### Branch Progress, Decisions & Rebuttals (advisory author context; Locked Task Specification above remains authoritative for Goal & Why, Bounds, and Done-check)",
+                        advisory,
+                    ]
+                )
     elif branch_spec:
         task_lines.extend(["", f"### Branch Task Specification (`{task_file}`)", branch_spec])
     if extra_ctx:

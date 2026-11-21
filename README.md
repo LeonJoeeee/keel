@@ -1,8 +1,8 @@
 # Keel
 
-Keel lets one developer direct parallel agents across Google Antigravity and OpenAI Codex CLI. Workers get the project's Core need, a bounded task, and an isolated Git worktree. Before a branch lands, an independent verifier exercises the change in a disposable clone. Task history and verification state stay local to the repository.
+Keel lets one developer or researcher direct parallel coding agents across Google Antigravity and OpenAI Codex CLI without babysitting turns, losing the project's purpose across compactions and worktrees, or merging fake-green code onto `main`. Every worker and independent verifier receives the repository's user-oriented Core need, Design Philosophy, and a single zero-context task specification in an isolated Git worktree or disposable clone. Task history and verification state stay local to the repository.
 
-The main session uses `rules/AGENTS.md` §4 to size work, choose an intensity level, and triage review findings. Standalone worker briefs receive §§1–3. The on-demand `keel-repo-ops` skill covers repository setup, task templates, ADRs, releases, and deployments.
+The main session uses `rules/AGENTS.md` §4 to size work, choose an intensity level, and triage review findings. Standalone worker briefs receive §§1–3. The on-demand `keel-repo-ops` skill covers the six-section repository map, Design Philosophy, zero-context task specs, ADRs, releases, and deployments.
 
 ## Install the Antigravity plugin
 
@@ -20,12 +20,18 @@ From the target repository, choose a level from L1 through L4 for the difficulty
 
 ```sh
 keel worktree create parser-fix
+
+# Single-document zero-context handoff (--why is extracted from `## Goal & Why` in the task file)
+keel agent run --level L2 --executor agy --mode write --preset implement \
+  --worktree parser-fix --task-file docs/tasks/active/20261121-parser-fix.md
+
+# Lightweight task-file-free run
 keel agent run --level L2 --executor agy --mode write --preset implement \
   --worktree parser-fix --why "Keep existing project files readable" \
   --task "Fix the parser's handling of empty sections and run its regression tests."
 ```
 
-`keel worktree list` shows active worktrees. Use `--task-file <file>` for a written assignment. Continue a resumable run with `keel agent resume <run_id> --message-file <file>` and optionally select a new `--level`.
+`keel worktree list` shows active worktrees. Use `--task-file <file>` for a thorough written specification (no `--why` needed when the spec contains `## Goal & Why` or `## Why`), and pass `--context-file <file>` for supplementary rework or pivot notes without mutating the `main`-locked spec. Continue a resumable run with `keel agent resume <run_id> --message-file <file>` and optionally select a new `--level`.
 
 ## Verify and land
 

@@ -3102,6 +3102,423 @@ class BranchGateTests(unittest.TestCase):
                 reb_leg_v = _run_cli(["branch", "verify", "rebased-legacy-anchor", *project])
                 self.assertEqual((reb_leg_v["outcome"], reb_leg_v["level"]), ("approve", "L4"))
 
+    def test_verify_inherits_why_and_surfaces_advisory_branch_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            _init_repo_with_task(repo, slug="handoff")
+            project = ["--project", str(repo)]
+
+            # 1. Task-file branch: `verify_branch` inherits locked `## Goal & Why` and surfaces branch advisory sections
+            wt_task = Path(_run_cli(["worktree", "create", "handoff", *project])["path"])
+            (wt_task / "calc.py").write_text(
+                "def add(a: int, b: int) -> int:\n    return a + b\n\ndef mul(a: int, b: int) -> int:\n    return a * b\n",
+                encoding="utf-8",
+            )
+            task_path = wt_task / "docs/tasks/active/20261117-handoff.md"
+            # Branch modifies Goal & Why + Bounds (must NOT weaken locked spec!) AND adds Progress / Decisions / Review Rebuttals
+            task_path.write_text(
+                "# Feature handoff\n\n"
+                "## Goal & Why\nTAMPERED BRANCH GOAL\n\n"
+                "## Bounds\nTAMPERED BRANCH BOUNDS\n\n"
+                "## Done-check\npython3 -c 'import calc'\n\n"
+                "## Progress\n- [x] Implemented mul()\n\n"
+                "## Decisions & Findings\n"
+                "Kept integer arithmetic exact.\n\n"
+                "### Review Rebuttals\n"
+                "Finding 1 (float division) is outside Bounds (`calc.py` integer mul only).\n",
+                encoding="utf-8",
+            )
+            _git(wt_task, "add", ".")
+            _git(wt_task, "commit", "-m", "feat: implement mul with progress and rebuttal")
+
+            captured_briefs: list[str] = []
+
+            def capture_verifier(adapter: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                captured_briefs.append(req.brief_path.read_text(encoding="utf-8"))
+                return verifier("approve")(adapter, req, defaults)
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "handoff", *project])
+                _run_cli(["branch", "verify", "handoff", *project, "--why", "Explicit CLI alignment override."])
+
+            brief_inherited = captured_briefs[0]
+            self.assertIn("## Why (Global Alignment)\n\nAdd mul() cleanly.", brief_inherited)
+            self.assertNotIn("## Why (Global Alignment)\n\nTAMPERED BRANCH GOAL", brief_inherited)
+            self.assertIn("### Locked Task Specification on `main`", brief_inherited)
+            self.assertIn("calc.py only.", brief_inherited)
+            advisory_heading = (
+                "### Branch Progress, Decisions & Rebuttals "
+                "(advisory author context; Locked Task Specification above remains authoritative for Goal & Why, Bounds, and Done-check)"
+            )
+            self.assertIn(advisory_heading, brief_inherited)
+            advisory_block = brief_inherited[brief_inherited.index(advisory_heading) :]
+            self.assertIn("- [x] Implemented mul()", advisory_block)
+            self.assertIn("Kept integer arithmetic exact.", advisory_block)
+            self.assertIn("Finding 1 (float division) is outside Bounds", advisory_block)
+            self.assertEqual(advisory_block.count("### Review Rebuttals"), 1)
+            self.assertNotIn("TAMPERED BRANCH BOUNDS", advisory_block)
+            self.assertNotIn("TAMPERED BRANCH GOAL", advisory_block)
+
+            # Explicit `--why` overrides locked spec `## Goal & Why`
+            self.assertIn("## Why (Global Alignment)\n\nExplicit CLI alignment override.", captured_briefs[1])
+
+            # CommonMark lazy list continuation & 4-space indented code blocks in locked spec do not hijack `verify_branch` Why
+            lazy_spec_rel = "docs/tasks/todo/20261117-lazy-handoff.md"
+            (repo / lazy_spec_rel).write_text(
+                "# Feature lazy-handoff\n\n"
+                "- The previous ticket used this example\n"
+                "as its reference template:\n\n"
+                "    ```markdown\n"
+                "  ## Why\n"
+                "  Old ticket objective.\n"
+                "    ```\n\n"
+                "## Goal & Why\n"
+                "Real objective.\n\n"
+                "## Bounds\ncalc.py only.\n",
+                encoding="utf-8",
+            )
+            indented_spec_rel = "docs/tasks/todo/20261117-indented-handoff.md"
+            (repo / indented_spec_rel).write_text(
+                "# Feature indented-handoff\n\n"
+                "    ```markdown\n"
+                "    ## Why\n"
+                "    Fake.\n\n"
+                "## Goal & Why\n"
+                "Real after indented code.\n\n"
+                "## Bounds\ncalc.py only.\n",
+                encoding="utf-8",
+            )
+            _git(repo, "add", lazy_spec_rel, indented_spec_rel)
+            _git(repo, "commit", "-m", "docs: add lazy and indented-code locked specs")
+
+            wt_lazy = Path(_run_cli(["worktree", "create", "lazy-handoff", *project])["path"])
+            (wt_lazy / "calc.py").write_text("LAZY_OK = 1\n", encoding="utf-8")
+            _git(wt_lazy, "commit", "-am", "feat: lazy handoff impl")
+            wt_indented = Path(_run_cli(["worktree", "create", "indented-handoff", *project])["path"])
+            (wt_indented / "calc.py").write_text("INDENTED_OK = 1\n", encoding="utf-8")
+            _git(wt_indented, "commit", "-am", "feat: indented handoff impl")
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "lazy-handoff", "--task-file", lazy_spec_rel, *project])
+                _run_cli(["branch", "verify", "indented-handoff", "--task-file", indented_spec_rel, *project])
+            self.assertIn("## Why (Global Alignment)\n\nReal objective.", captured_briefs[-2])
+            self.assertNotIn("## Why (Global Alignment)\n\nOld ticket objective.", captured_briefs[-2])
+            self.assertIn("## Why (Global Alignment)\n\nReal after indented code.", captured_briefs[-1])
+            self.assertNotIn("## Why (Global Alignment)\n\nFake.", captured_briefs[-1])
+
+            # Round 5: committed task files starting with line-1 4-space indented `    ## Why` or `<!-- ... -->` comments
+            line1_indented_rel = "docs/tasks/todo/20261117-line1-indented.md"
+            (repo / line1_indented_rel).write_text(
+                "    ## Why\n    Example only.\n\n## Goal & Why\nPrevent data loss.\n\n## Bounds\ncalc.py only.\n",
+                encoding="utf-8",
+            )
+            html_comment_rel = "docs/tasks/todo/20261117-html-comment.md"
+            (repo / html_comment_rel).write_text(
+                "<!--\n## Why\nCommented placeholder.\n-->\n\n## Goal & Why\nActual user goal.\n\n## Bounds\ncalc.py only.\n",
+                encoding="utf-8",
+            )
+            _git(repo, "add", line1_indented_rel, html_comment_rel)
+            _git(repo, "commit", "-m", "docs: add line-1 indented code and html-comment locked specs")
+
+            wt_line1 = Path(_run_cli(["worktree", "create", "line1-indented", *project])["path"])
+            (wt_line1 / "calc.py").write_text("LINE1_INDENTED_OK = 1\n", encoding="utf-8")
+            _git(wt_line1, "commit", "-am", "feat: line1 indented impl")
+            wt_comment = Path(_run_cli(["worktree", "create", "html-comment", *project])["path"])
+            (wt_comment / "calc.py").write_text("HTML_COMMENT_OK = 1\n", encoding="utf-8")
+            _git(wt_comment, "commit", "-am", "feat: html comment impl")
+
+            def noop_agy_run(adapter: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                return {"status": "completed", "executor": "agy", "level": req.level, "model": "test-agy"}
+
+            with mock.patch.object(AgyExecutor, "execute", noop_agy_run):
+                run_line1 = _run_cli([
+                    "agent", "run", *project, "--executor", "agy", "--mode", "read", "--level", "L2",
+                    "--task-file", str(repo / line1_indented_rel), "--run-id", "line1-indented-agent-check",
+                ])
+                run_comment = _run_cli([
+                    "agent", "run", *project, "--executor", "agy", "--mode", "read", "--level", "L2",
+                    "--task-file", str(repo / html_comment_rel), "--run-id", "html-comment-agent-check",
+                ])
+            self.assertEqual(run_line1["why"], "Prevent data loss.")
+            self.assertEqual(run_comment["why"], "Actual user goal.")
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "line1-indented", "--task-file", line1_indented_rel, *project])
+                _run_cli(["branch", "verify", "html-comment", "--task-file", html_comment_rel, *project])
+            brief_line1 = captured_briefs[-2]
+            brief_comment = captured_briefs[-1]
+            self.assertIn("## Why (Global Alignment)\n\nPrevent data loss.", brief_line1)
+            self.assertNotIn("## Why (Global Alignment)\n\nExample only.", brief_line1)
+            self.assertIn("\n    ## Why\n    Example only.", brief_line1)
+            comment_why_header = brief_comment.split("## Task, Scope & Done Criteria")[0]
+            self.assertIn("## Why (Global Alignment)\n\nActual user goal.", comment_why_header)
+            self.assertNotIn("Commented placeholder", comment_why_header)
+            self.assertNotIn("-->", comment_why_header)
+
+            # Round 6: UTF-8 BOM (`\ufeff`) before `~~~md` fence / directly before `## Why`, and 4-space indented
+            # code block at the start of `## Decisions & Findings` preserved in verifier advisory output
+            bom_fence_rel = "docs/tasks/todo/20261117-bom-fence.md"
+            (repo / bom_fence_rel).write_bytes(
+                "\ufeff~~~md\n## Why\nFake BOM fenced why.\n~~~\n\n## Goal & Why\nReal goal after BOM fence.\n\n## Bounds\ncalc.py only.\n".encode("utf-8")
+            )
+            bom_why_rel = "docs/tasks/todo/20261117-bom-why.md"
+            (repo / bom_why_rel).write_bytes(
+                "\ufeff## Why\nDirect BOM goal.\n\n## Bounds\ncalc.py only.\n".encode("utf-8")
+            )
+            _git(repo, "add", bom_fence_rel, bom_why_rel)
+            _git(repo, "commit", "-m", "docs: add UTF-8 BOM fence and BOM heading locked specs")
+
+            wt_bom_fence = Path(_run_cli(["worktree", "create", "bom-fence", *project])["path"])
+            (wt_bom_fence / "calc.py").write_text("BOM_FENCE_OK = 1\n", encoding="utf-8")
+            _git(wt_bom_fence, "commit", "-am", "feat: bom fence impl")
+
+            wt_bom_why = Path(_run_cli(["worktree", "create", "bom-why", *project])["path"])
+            (wt_bom_why / "calc.py").write_text("BOM_WHY_OK = 1\n", encoding="utf-8")
+            # Branch updates `## Decisions & Findings` starting directly with a 4-space indented `    ## Done-check`
+            (wt_bom_why / bom_why_rel).write_text(
+                "## Why\nDirect BOM goal.\n\n## Bounds\ncalc.py only.\n\n"
+                "## Decisions & Findings\n\n"
+                "    ## Done-check\n"
+                "    Example code block\n",
+                encoding="utf-8",
+            )
+            _git(wt_bom_why, "add", "calc.py", bom_why_rel)
+            _git(wt_bom_why, "commit", "-m", "feat: bom why impl with indented advisory block")
+
+            with mock.patch.object(AgyExecutor, "execute", noop_agy_run):
+                run_bom_fence = _run_cli([
+                    "agent", "run", *project, "--executor", "agy", "--mode", "read", "--level", "L2",
+                    "--task-file", str(repo / bom_fence_rel), "--run-id", "bom-fence-agent-check",
+                ])
+                run_bom_why = _run_cli([
+                    "agent", "run", *project, "--executor", "agy", "--mode", "read", "--level", "L2",
+                    "--task-file", str(repo / bom_why_rel), "--run-id", "bom-why-agent-check",
+                ])
+            self.assertEqual(run_bom_fence["why"], "Real goal after BOM fence.")
+            self.assertEqual(run_bom_why["why"], "Direct BOM goal.")
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "bom-fence", "--task-file", bom_fence_rel, *project])
+                _run_cli(["branch", "verify", "bom-why", "--task-file", bom_why_rel, *project])
+            brief_bom_fence_v = captured_briefs[-2]
+            brief_bom_why_v = captured_briefs[-1]
+            self.assertNotIn("\ufeff", brief_bom_fence_v)
+            self.assertIn("## Why (Global Alignment)\n\nReal goal after BOM fence.", brief_bom_fence_v)
+            self.assertNotIn("Fake BOM fenced why.", brief_bom_fence_v.split("## Task, Scope & Done Criteria")[0])
+            self.assertNotIn("\ufeff", brief_bom_why_v)
+            self.assertIn("## Why (Global Alignment)\n\nDirect BOM goal.", brief_bom_why_v)
+            self.assertIn(
+                "## Decisions & Findings\n\n    ## Done-check\n    Example code block",
+                brief_bom_why_v,
+            )
+
+            # When branch ONLY tampers with `## Bounds` (no Progress/Decisions/Rebuttals change), NO advisory block is added
+            task_path.write_text(
+                "# Feature handoff\n\n"
+                "## Goal & Why\nAdd mul() cleanly.\n\n"
+                "## Bounds\nONLY BOUNDS CHANGED\n\n"
+                "## Done-check\npython3 -c 'import calc'\n\n"
+                "## Progress\n- [ ] Implement\n",
+                encoding="utf-8",
+            )
+            _git(wt_task, "commit", "-am", "chore: touch bounds only")
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "handoff", *project])
+            self.assertNotIn(advisory_heading, captured_briefs[-1])
+
+            # Missing, untraversable (`chmod 000`), or UTF-16 `--context-file` on `branch verify` fails cleanly with exit 2
+            with self.assertRaisesRegex(KeelError, "--context-file"):
+                _run_cli(["branch", "verify", "handoff", *project, "--context-file", str(repo / "nope.md")])
+            clean_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("KEEL_AGENT_MODE", "DEVSTANDARD_AGENT_MODE", "DEVSTANDARD_ROLE")
+            }
+            if os.geteuid() != 0:
+                locked_v_dir = repo / "locked-verify-dir"
+                locked_v_dir.mkdir()
+                locked_v_ctx = locked_v_dir / "ctx.md"
+                locked_v_ctx.write_text("hidden\n", encoding="utf-8")
+                locked_v_dir.chmod(0o000)
+                try:
+                    proc_perm_v = subprocess.run(
+                        [str(ROOT / "scripts" / "keel"), "branch", "verify", "handoff", *project, "--context-file", str(locked_v_ctx)],
+                        cwd=repo, capture_output=True, text=True, timeout=10, env=clean_env,
+                    )
+                    self.assertEqual(proc_perm_v.returncode, 2)
+                    self.assertIn("keel error:", proc_perm_v.stderr)
+                    self.assertIn("--context-file", proc_perm_v.stderr)
+                    self.assertNotIn("Traceback", proc_perm_v.stderr)
+                finally:
+                    locked_v_dir.chmod(0o755)
+                    locked_v_ctx.unlink()
+                    locked_v_dir.rmdir()
+
+            utf16_verify_ctx = repo / "utf16-verify-context.md"
+            utf16_verify_ctx.write_bytes("UTF-16 verify note".encode("utf-16"))
+            proc_utf16_v = subprocess.run(
+                [str(ROOT / "scripts" / "keel"), "branch", "verify", "handoff", *project, "--context-file", str(utf16_verify_ctx)],
+                cwd=repo, capture_output=True, text=True, timeout=10, env=clean_env,
+            )
+            self.assertEqual(proc_utf16_v.returncode, 2)
+            self.assertIn("keel error:", proc_utf16_v.stderr)
+            self.assertIn("UTF-8", proc_utf16_v.stderr)
+            self.assertNotIn("Traceback", proc_utf16_v.stderr)
+            utf16_verify_ctx.unlink()
+
+            # Committed non-UTF-8 (UTF-16) task blob on a branch exits 2 cleanly naming the path and revision
+            wt_utf16_blob = Path(_run_cli(["worktree", "create", "utf16-blob", *project])["path"])
+            (wt_utf16_blob / "docs/tasks/active/20261117-handoff.md").write_bytes(
+                "# UTF-16 task spec\n\n## Goal & Why\nEncoded in UTF-16.\n".encode("utf-16")
+            )
+            _git(wt_utf16_blob, "add", "docs/tasks/active/20261117-handoff.md")
+            _git(wt_utf16_blob, "commit", "-m", "chore: commit utf16 task blob")
+            utf16_blob_head = _git(wt_utf16_blob, "rev-parse", "HEAD")
+            proc_utf16_blob = subprocess.run(
+                [
+                    str(ROOT / "scripts" / "keel"), "branch", "verify", "utf16-blob", *project,
+                    "--task-file", "docs/tasks/active/20261117-handoff.md",
+                ],
+                cwd=repo, capture_output=True, text=True, timeout=10, env=clean_env,
+            )
+            self.assertEqual(proc_utf16_blob.returncode, 2)
+            self.assertIn("keel error:", proc_utf16_blob.stderr)
+            self.assertIn("docs/tasks/active/20261117-handoff.md", proc_utf16_blob.stderr)
+            self.assertIn(utf16_blob_head, proc_utf16_blob.stderr)
+            self.assertIn("UTF-8", proc_utf16_blob.stderr)
+            self.assertNotIn("Traceback", proc_utf16_blob.stderr)
+
+            # 2. Task-file-free branch: `verify_branch` inherits recorded Orchestrator `last_write["why"]`
+            #    both on normal run->resume AND when initial `agent run` fails recoverably before `agent resume` commits!
+            wt_fail_rec = Path(_run_cli(["worktree", "create", "taskless-recovered", *project])["path"])
+
+            def agy_recoverable_fail(adapter: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                from keel_lib.executors.base import KeelExecutionError
+
+                raise KeelExecutionError(
+                    "transient timeout after session start",
+                    {"status": "failed", "session_id": "sess-recoverable", "model": "test-agy"},
+                )
+
+            def agy_recovered_resume(
+                adapter: Any,
+                run_dir: Path,
+                record: dict[str, Any],
+                followup_path: Path,
+                output_path: Path,
+                defaults: dict[str, Any],
+                *,
+                level: str | None = None,
+                model: str | None = None,
+                effort: str | None = None,
+            ) -> dict[str, Any]:
+                (Path(record["workdir"]) / "calc.py").write_text(
+                    "def add(a: int, b: int) -> int:\n    return int(a) + int(b)\n", encoding="utf-8"
+                )
+                _git(Path(record["workdir"]), "commit", "-am", "feat: commit on resumed session after initial failure")
+                return {"status": "completed", "executor": "agy", "model": "test-agy"}
+
+            with (
+                mock.patch.object(AgyExecutor, "execute", agy_recoverable_fail),
+                mock.patch.object(AgyExecutor, "resume", agy_recovered_resume),
+            ):
+                with self.assertRaisesRegex(KeelError, "transient timeout"):
+                    _run_cli([
+                        "agent", "run", *project, "--worktree", "taskless-recovered",
+                        "--executor", "agy", "--mode", "write", "--preset", "implement", "--level", "L2",
+                        "--run-id", "recoverable-run",
+                        "--why", "Preserve Orchestrator Why across failed run into resume.",
+                        "--task", "Coerce operands in add().",
+                    ])
+                failed_run_json = json.loads((repo / ".agents/runs/recoverable-run/run.json").read_text(encoding="utf-8"))
+                self.assertEqual(failed_run_json["why"], "Preserve Orchestrator Why across failed run into resume.")
+                self.assertIsNone(load_branch_state(repo / ".git", "task/taskless-recovered").get("last_write"))
+
+                _run_cli([
+                    "agent", "resume", "recoverable-run", *project, "--level", "L2",
+                    "--message", "Finish and commit.",
+                ])
+                recovered_write = load_branch_state(repo / ".git", "task/taskless-recovered")["last_write"]
+                self.assertEqual(recovered_write["why"], "Preserve Orchestrator Why across failed run into resume.")
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "taskless-recovered", *project])
+            self.assertIn(
+                "## Why (Global Alignment)\n\nPreserve Orchestrator Why across failed run into resume.",
+                captured_briefs[-1],
+            )
+
+            wt_free = Path(_run_cli(["worktree", "create", "taskless-why", *project])["path"])
+
+            def agy_writer_exec(adapter: Any, req: Any, defaults: Any) -> dict[str, Any]:
+                (req.workdir / "calc.py").write_text("def add(a: int, b: int) -> int:\n    return a + b + 0\n", encoding="utf-8")
+                _git(req.workdir, "commit", "-am", "feat: taskless edit")
+                return {
+                    "status": "completed",
+                    "executor": "agy",
+                    "level": req.level,
+                    "model": "test-agy",
+                    "session_id": "sess-taskless",
+                    "output_path": str(req.output_path),
+                }
+
+            def agy_writer_resume(
+                adapter: Any,
+                run_dir: Path,
+                record: dict[str, Any],
+                followup_path: Path,
+                output_path: Path,
+                defaults: dict[str, Any],
+                *,
+                level: str | None = None,
+                model: str | None = None,
+                effort: str | None = None,
+            ) -> dict[str, Any]:
+                (Path(record["workdir"]) / "calc.py").write_text(
+                    "def add(a: int, b: int) -> int:\n    return int(a) + int(b)\n", encoding="utf-8"
+                )
+                _git(Path(record["workdir"]), "commit", "-am", "feat: resumed taskless edit")
+                return {"status": "completed", "executor": "agy", "model": "test-agy"}
+
+            with (
+                mock.patch.object(AgyExecutor, "execute", agy_writer_exec),
+                mock.patch.object(AgyExecutor, "resume", agy_writer_resume),
+            ):
+                _run_cli([
+                    "agent", "run", *project, "--worktree", "taskless-why",
+                    "--executor", "agy", "--mode", "write", "--preset", "implement", "--level", "L2",
+                    "--run-id", "taskless-run",
+                    "--why", "Keep operand coercion explicit for taskless branch.",
+                    "--task", "Coerce operands in add().",
+                ])
+                saved_after_run = load_branch_state(repo / ".git", "task/taskless-why")["last_write"]
+                self.assertEqual(saved_after_run["why"], "Keep operand coercion explicit for taskless branch.")
+
+                _run_cli([
+                    "agent", "resume", "taskless-run", *project, "--level", "L2",
+                    "--message", "Also cast both operands to int.",
+                ])
+                saved_after_resume = load_branch_state(repo / ".git", "task/taskless-why")["last_write"]
+                self.assertEqual(saved_after_resume["why"], "Keep operand coercion explicit for taskless branch.")
+
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "taskless-why", *project])
+            self.assertIn(
+                "## Why (Global Alignment)\n\nKeep operand coercion explicit for taskless branch.",
+                captured_briefs[-1],
+            )
+
+            # 3. Task-file-free branch with NO recorded write falls back to default alignment sentence
+            wt_manual = Path(_run_cli(["worktree", "create", "manual-taskless", *project])["path"])
+            (wt_manual / "calc.py").write_text("VALUE = 42\n", encoding="utf-8")
+            _git(wt_manual, "commit", "-am", "feat: manual edit")
+            with mock.patch.object(CodexExecutor, "execute", capture_verifier):
+                _run_cli(["branch", "verify", "manual-taskless", *project])
+            self.assertIn(
+                "## Why (Global Alignment)\n\nIndependently verify branch 'task/manual-taskless' against the repository's Core need",
+                captured_briefs[-1],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
